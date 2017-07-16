@@ -213,12 +213,24 @@ def install(args, parser, command='install'):
             unlink_link_transaction = revert_actions(prefix, get_revision(args.revision), index)
             progressive_fetch_extract = unlink_link_transaction.get_pfe()
         else:
-            solver = Solver(prefix, context.channels, context.subdirs, specs_to_add=specs)
-            index, _ = solver._prepare()
-            unlink_link_transaction = solver.solve_for_transaction(
-                force_reinstall=context.force,
-            )
-            progressive_fetch_extract = unlink_link_transaction.get_pfe()
+            if context.blacklist:
+                final_channels = [c for c in context.channels if c not in context.blacklist]
+                import pdb; pdb.set_trace()
+
+                solver = Solver(prefix, final_channels, context.subdirs, specs_to_add=specs)
+                index, _ = solver._prepare()
+                unlink_link_transaction = solver.solve_for_transaction(
+                    force_reinstall=context.force,
+                    )
+                progressive_fetch_extract = unlink_link_transaction.get_pfe()
+
+            else:
+                solver = Solver(prefix, context.channels, context.subdirs, specs_to_add=specs)
+                index, _ = solver._prepare()
+                unlipnk_link_transaction = solver.solve_for_transaction(
+                    force_reinstall=context.force,
+                )
+                progressive_fetch_extract = unlink_link_transaction.get_pfe()
 
     except ResolvePackageNotFound as e:
         channel_priority_map = get_channel_priority_map(

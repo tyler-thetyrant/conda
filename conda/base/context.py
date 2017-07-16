@@ -141,6 +141,7 @@ class Context(Configuration):
     # channels
     _channels = SequenceParameter(string_types, default=(DEFAULTS_CHANNEL_NAME,),
                                   aliases=('channels', 'channel',))  # channel for args.channel
+    _blacklists = SequenceParameter(string_types, default=(), aliases=('blacklist', 'exclude'))
     _migrated_channel_aliases = SequenceParameter(string_types,
                                                   aliases=('migrated_channel_aliases',))  # TODO: also take a list of strings # NOQA
     _default_channels = SequenceParameter(string_types, DEFAULT_CHANNELS,
@@ -158,6 +159,7 @@ class Context(Configuration):
     debug = PrimitiveParameter(False)
     dry_run = PrimitiveParameter(False)
     error_upload_url = PrimitiveParameter(ERROR_UPLOAD_URL)
+    exclude = PrimitiveParameter(False)
     force = PrimitiveParameter(False)
     json = PrimitiveParameter(False)
     no_dependencies = PrimitiveParameter(False, aliases=('no_deps',))
@@ -493,6 +495,11 @@ class Context(Configuration):
             if argparse_channels and argparse_channels == self._channels:
                 return argparse_channels + (DEFAULTS_CHANNEL_NAME,)
         return self._channels or ()
+
+    @property
+    def blacklist(self):
+
+        return self._blacklists or ()
 
     def get_descriptions(self):
         return get_help_dict()
