@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import sys
-from errno import EACCES, ENOENT, EPERM
+from errno import EACCES, EEXIST, ENOENT, ENOTEMPTY, EPERM, errorcode
 from logging import getLogger
-from os.path import basename
+from os import makedirs
+from os.path import basename, isdir
+import sys
 from time import sleep
 
 from ...common.compat import on_win
@@ -35,14 +36,30 @@ def exp_backoff_fn(fn, *args, **kwargs):
                 caller_frame = sys._getframe(1)
                 log.trace("retrying %s/%s %s() in %g sec",
                           basename(caller_frame.f_code.co_filename),
-                          caller_frame.f_lineno, fn.__name__,
+                          caller_frame.f_lineno,
+                          fn.__name__,
                           sleep_time)
                 sleep(sleep_time)
-            elif e.errno in (ENOENT,):
+            elif e.errno in (ENOENT, ENOTEMPTY):
                 # errno.ENOENT File not found error / No such file or directory
+                # errno.ENOTEMPTY OSError(41, 'The directory is not empty')
                 raise
             else:
-                log.warn("Uncaught backoff with errno %d", e.errno)
+                log.warn("Uncaught backoff with errno %s %d", errorcode[e.errno], e.errno)
                 raise
         else:
             return result
+
+
+def mkdir_p(path):
+    # putting this here to help with circular imports
+    try:
+        log.trace('making directory %s', path)
+        if path:
+            makedirs(path)
+            return isdir(path) and path
+    except OSError as e:
+        if e.errno == EEXIST and isdir(path):
+            return path
+        else:
+            raise

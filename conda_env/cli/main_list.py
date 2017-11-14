@@ -1,6 +1,7 @@
 from argparse import RawDescriptionHelpFormatter
 
 from conda.cli import common
+from conda.cli.conda_argparse import add_parser_json
 
 description = """
 List the Conda environments
@@ -14,7 +15,7 @@ examples:
 
 
 def configure_parser(sub_parsers):
-    l = sub_parsers.add_parser(
+    list_parser = sub_parsers.add_parser(
         'list',
         formatter_class=RawDescriptionHelpFormatter,
         description=description,
@@ -22,9 +23,9 @@ def configure_parser(sub_parsers):
         epilog=example,
     )
 
-    common.add_parser_json(l)
+    add_parser_json(list_parser)
 
-    l.set_defaults(func=execute)
+    list_parser.set_defaults(func=execute)
 
 
 def execute(args, parser):

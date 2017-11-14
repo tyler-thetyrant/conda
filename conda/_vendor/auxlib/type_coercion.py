@@ -3,8 +3,10 @@ from collections import Mapping
 from itertools import chain
 from re import IGNORECASE, compile
 
+from enum import Enum
+
 from .compat import NoneType, integer_types, isiterable, iteritems, string_types, text_type
-from .decorators import memoize, memoizedproperty
+from .decorators import memoizedproperty
 from .exceptions import AuxlibError
 
 __all__ = ["boolify", "typify", "maybecall", "listify", "numberify"]
@@ -16,7 +18,6 @@ BOOL_COERCEABLE_TYPES = integer_types + (bool, float, complex, list, set, dict, 
 NUMBER_TYPES = integer_types + (float, complex)
 NUMBER_TYPES_SET = set(NUMBER_TYPES)
 STRING_TYPES_SET = set(string_types)
-BOOLNULL_TYPE_SET = {bool, NoneType}
 
 NO_MATCH = object()
 
@@ -175,7 +176,11 @@ def boolify_truthy_string_ok(value):
         return True
 
 
-@memoize
+def typify_str_no_hint(value):
+    candidate = _REGEX.convert(value)
+    return candidate if candidate is not NO_MATCH else value
+
+
 def typify(value, type_hint=None):
     """Take a primitive value, usually a string, and try to make a more relevant type out of it.
     An optional type_hint will try to coerce the value to that type.
@@ -211,15 +216,25 @@ def typify(value, type_hint=None):
     # now we either have a stripped string, a type hint, or both
     # use the hint if it exists
     if isiterable(type_hint):
+        if isinstance(type_hint, type) and issubclass(type_hint, Enum):
+            try:
+                return type_hint(value)
+            except ValueError:
+                return type_hint[value]
         type_hint = set(type_hint)
         if not (type_hint - NUMBER_TYPES_SET):
             return numberify(value)
         elif not (type_hint - STRING_TYPES_SET):
             return text_type(value)
-        elif not (type_hint - BOOLNULL_TYPE_SET):
+        elif not (type_hint - {bool, NoneType}):
             return boolify(value, nullable=True)
         elif not (type_hint - (STRING_TYPES_SET | {bool})):
             return boolify(value, return_string=True)
+        elif not (type_hint - (STRING_TYPES_SET | {NoneType})):
+            value = text_type(value)
+            return None if value.lower() == 'none' else value
+        elif not (type_hint - {bool, int}):
+            return typify_str_no_hint(text_type(value))
         else:
             raise NotImplementedError()
     elif type_hint is not None:
@@ -231,12 +246,8 @@ def typify(value, type_hint=None):
             raise TypeCoercionError(value, text_type(e))
     else:
         # no type hint, but we know value is a string, so try to match with the regex patterns
-        candidate = _REGEX.convert(value)
-        if candidate is not NO_MATCH:
-            return candidate
-
-        # nothing has caught so far; give up, and return the value that was given
-        return value
+        #   if there's still no match, `typify_str_no_hint` will return `value`
+        return typify_str_no_hint(value)
 
 
 def typify_data_structure(value, type_hint=None):

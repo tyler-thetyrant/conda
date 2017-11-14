@@ -2,33 +2,41 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import os
-from conda.common.path import win_path_backout
+from os.path import join
 from tempfile import gettempdir
+from unittest import TestCase
 
 import pytest
+
 from conda._vendor.auxlib.ish import dals
 from conda._vendor.toolz.itertoolz import concat
+from conda.base.constants import PathConflict
 from conda.base.context import context, reset_context
 from conda.common.compat import odict
 from conda.common.configuration import ValidationError, YamlRawParameter
 from conda.common.io import env_var
+from conda.common.path import expand, win_path_backout
 from conda.common.url import join_url, path_to_url
-from conda.common.yaml import yaml_load
+from conda.common.serialize import yaml_load
 from conda.gateways.disk.create import mkdir_p
 from conda.gateways.disk.delete import rm_rf
 from conda.models.channel import Channel
 from conda.utils import on_win
-from os.path import basename, dirname, join
-from unittest import TestCase
 
 
-class ContextTests(TestCase):
+class ContextCustomRcTests(TestCase):
 
     def setUp(self):
         string = dals("""
         custom_channels:
           darwin: https://some.url.somewhere/stuff
           chuck: http://another.url:8080/with/path
+        custom_multichannels:
+          michele:
+            - https://do.it.with/passion
+            - learn_from_every_thing
+          steve:
+            - more-downloads
         migrated_custom_channels:
           darwin: s3://just/cant
           chuck: file:///var/lib/repo/
@@ -37,6 +45,13 @@ class ContextTests(TestCase):
         channel_alias: ftp://new.url:8082
         conda-build:
           root-dir: /some/test/path
+        proxy_servers:
+          http: http://user:pass@corp.com:8080
+          https: none
+          ftp:
+          sftp: ''
+          ftps: false
+          rsync: 'false'
         """)
         reset_context()
         rd = odict(testdata=YamlRawParameter.make_raw_parameters('testdata', yaml_load(string)))
@@ -106,7 +121,7 @@ class ContextTests(TestCase):
         try:
             mkdir_p(conda_bld_path)
             with env_var('CONDA_BLD_PATH', conda_bld_path, reset_context):
-                assert len(context.conda_build_local_paths) == 2
+                assert len(context.conda_build_local_paths) >= 1
                 assert context.conda_build_local_paths[0] == conda_bld_path
 
                 channel = Channel('local')
@@ -143,7 +158,56 @@ class ContextTests(TestCase):
         finally:
             rm_rf(conda_bld_path)
 
+    def test_custom_multichannels(self):
+        assert context.custom_multichannels['michele'] == (
+            Channel('passion'),
+            Channel('learn_from_every_thing'),
+        )
+
+    def test_proxy_servers(self):
+        assert context.proxy_servers['http'] == 'http://user:pass@corp.com:8080'
+        assert context.proxy_servers['https'] is None
+        assert context.proxy_servers['ftp'] is None
+        assert context.proxy_servers['sftp'] == ''
+        assert context.proxy_servers['ftps'] == 'False'
+        assert context.proxy_servers['rsync'] == 'false'
+
     def test_conda_build_root_dir(self):
         assert context.conda_build['root-dir'] == "/some/test/path"
-        from conda.config import rc
-        assert rc.get('conda-build')['root-dir'] == "/some/test/path"
+
+    def test_clobber_enum(self):
+        with env_var("CONDA_PATH_CONFLICT", 'prevent', reset_context):
+            assert context.path_conflict == PathConflict.prevent
+
+    def test_describe_all(self):
+        paramter_names = context.list_parameters()
+        from pprint import pprint
+        for name in paramter_names:
+            pprint(context.describe_parameter(name))
+
+    def test_local_build_root_custom_rc(self):
+        assert context.local_build_root == "C:\\some\\test\\path" if on_win else "/some/test/path"
+
+        test_path_1 = join(os.getcwd(), 'test_path_1')
+        with env_var("CONDA_CROOT", test_path_1, reset_context):
+            assert context.local_build_root == test_path_1
+
+        test_path_2 = join(os.getcwd(), 'test_path_2')
+        with env_var("CONDA_BLD_PATH", test_path_2, reset_context):
+            assert context.local_build_root == test_path_2
+
+
+class ContextDefaultRcTests(TestCase):
+
+    def test_subdirs(self):
+        assert context.subdirs == (context.subdir, 'noarch')
+
+        subdirs = ('linux-highest', 'linux-64', 'noarch')
+        with env_var('CONDA_SUBDIRS', ','.join(subdirs), reset_context):
+            assert context.subdirs == subdirs
+
+    def test_local_build_root_default_rc(self):
+        if context.root_writable:
+            assert context.local_build_root == join(context.root_prefix, 'conda-bld')
+        else:
+            assert context.local_build_root == expand('~/conda-bld')

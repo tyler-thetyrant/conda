@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import sys
-from enum import Enum
 from platform import machine
+import sys
+
+from enum import Enum
+
+from .._vendor.auxlib.decorators import classproperty
+from .._vendor.auxlib.ish import dals
+from .._vendor.auxlib.type_coercion import TypeCoercionError, boolify
+from ..common.compat import string_types
+from ..exceptions import CondaUpgradeError
 
 
 class Arch(Enum):
@@ -11,6 +18,7 @@ class Arch(Enum):
     x86_64 = 'x86_64'
     armv6l = 'armv6l'
     armv7l = 'armv7l'
+    aarch64 = 'aarch64'
     ppc64le = 'ppc64le'
     z = 'z'
 
@@ -68,6 +76,9 @@ class LinkType(Enum):
     def __str__(self):
         return self.name
 
+    def __json__(self):
+        return self.name
+
 
 class PathType(Enum):
     """
@@ -82,7 +93,64 @@ class PathType(Enum):
     linked_package_record = 'linked_package_record'  # a package's .json file in conda-meta
     pyc_file = 'pyc_file'
     unix_python_entry_point = 'unix_python_entry_point'
-    windows_python_entry_point = 'windows_python_entry_point'
+    windows_python_entry_point_script = 'windows_python_entry_point_script'
+    windows_python_entry_point_exe = 'windows_python_entry_point_exe'
+
+    @classproperty
+    def basic_types(self):
+        return (PathType.hardlink, PathType.softlink, PathType.directory)
 
     def __str__(self):
         return self.name
+
+    def __json__(self):
+        return self.name
+
+
+class LeasedPathType(Enum):
+    application_entry_point = 'application_entry_point'
+    application_entry_point_windows_exe = 'application_entry_point_windows_exe'
+    application_softlink = 'application_softlink'
+
+    def __str__(self):
+        return self.name
+
+    def __json__(self):
+        return self.name
+
+
+class PackageType(Enum):
+    NOARCH_GENERIC = 'noarch_generic'
+    NOARCH_PYTHON = 'noarch_python'
+    NOARCH_PRELINK_PYTHON = 'noarch_prelink_python'
+    SHADOW_PRIVATE_ENV = 'shadow_private_env'
+    SHADOW_PIP = 'shadow_pip'
+
+
+class NoarchType(Enum):
+    generic = 'generic'
+    python = 'python'
+
+    @staticmethod
+    def coerce(val):
+        # what a mess
+        if isinstance(val, NoarchType):
+            return val
+        if isinstance(val, bool):
+            val = NoarchType.generic if val else None
+        if isinstance(val, string_types):
+            val = val.lower()
+            if val == 'python':
+                val = NoarchType.python
+            elif val == 'generic':
+                val = NoarchType.generic
+            else:
+                try:
+                    val = NoarchType.generic if boolify(val) else None
+                except TypeCoercionError:
+                    raise CondaUpgradeError(dals("""
+                    The noarch type for this package is set to '%s'.
+                    The current version of conda is too old to install this package.
+                    Please update conda.
+                    """ % val))
+        return val

@@ -1,32 +1,35 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import hashlib
-import json
-import shlex
 from base64 import b64encode
 from collections import namedtuple
 from errno import ENOENT
 from functools import partial
+from glob import glob
+import hashlib
 from itertools import chain
+import json
 from logging import getLogger
-from os import X_OK, access, listdir
-from os.path import lexists, isdir, isfile, islink, join
+from os import listdir
+from os.path import isdir, isfile, join
+import shlex
+import tarfile
 
-from conda.common.compat import on_win
-from conda.models.enums import PathType
+from .link import islink, lexists
+from ..._vendor.auxlib.collection import first
 from ..._vendor.auxlib.ish import dals
 from ...base.constants import PREFIX_PLACEHOLDER
-from ...exceptions import CondaFileNotFoundError, CondaUpgradeError
+from ...common.compat import ensure_text_type
+from ...exceptions import CondaUpgradeError, CondaVerificationError, PathNotFoundError
 from ...models.channel import Channel
-from ...models.enums import FileMode
-from ...models.index_record import IndexRecord
-from ...models.package_info import PackageInfo, PackageMetadata, PathData, PathDataV1, PathsData
+from ...models.enums import FileMode, PathType
+from ...models.index_record import IndexJsonRecord, IndexRecord, PathData, PathDataV1, PathsData
+from ...models.package_info import PackageInfo, PackageMetadata
 
 log = getLogger(__name__)
 
 listdir = listdir
-lexists, isdir, isfile, islink = lexists, isdir, isfile, islink
+lexists, isdir, isfile = lexists, isdir, isfile
 
 
 def yield_lines(path):
@@ -48,37 +51,54 @@ def yield_lines(path):
                 yield line
     except (IOError, OSError) as e:
         if e.errno == ENOENT:
-            raise StopIteration
+            pass
         else:
             raise
 
 
+def _digest_path(algo, path):
+    if not isfile(path):
+        raise PathNotFoundError(path)
+
+    hasher = hashlib.new(algo)
+    with open(path, "rb") as fh:
+        for chunk in iter(partial(fh.read, 8192), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def compute_md5sum(file_full_path):
-    if not isfile(file_full_path):
-        raise CondaFileNotFoundError(file_full_path)
-
-    hash_md5 = hashlib.md5()
-    with open(file_full_path, "rb") as fh:
-        for chunk in iter(partial(fh.read, 4096), b''):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+    return _digest_path('md5', file_full_path)
 
 
-def is_exe(path):
-    return isfile(path) and (access(path, X_OK) or (on_win and path.endswith(('.exe', '.bat'))))
+def compute_sha256sum(file_full_path):
+    return _digest_path('sha256', file_full_path)
 
 
-def read_package_info(record, extracted_package_directory):
-    index_json_record = read_index_json(extracted_package_directory)
-    icondata = read_icondata(extracted_package_directory)
-    package_metadata = read_package_metadata(extracted_package_directory)
-    paths_data = read_paths_json(extracted_package_directory)
+def find_first_existing(*globs):
+    for g in globs:
+        for path in glob(g):
+            if lexists(path):
+                return path
+    return None
+
+
+# ####################################################
+# functions supporting read_package_info()
+# ####################################################
+
+def read_package_info(record, package_cache_record):
+    epd = package_cache_record.extracted_package_dir
+    index_json_record = read_index_json(epd)
+    icondata = read_icondata(epd)
+    package_metadata = read_package_metadata(epd)
+    paths_data = read_paths_json(epd)
 
     return PackageInfo(
-        extracted_package_dir=extracted_package_directory,
+        extracted_package_dir=epd,
         channel=Channel(record.schannel or record.channel),
         repodata_record=record,
-        url=record.url,
+        url=package_cache_record.url,
 
         index_json_record=index_json_record,
         icondata=icondata,
@@ -87,13 +107,21 @@ def read_package_info(record, extracted_package_directory):
     )
 
 
-# ####################################################
-# functions supporting read_package_info()
-# ####################################################
-
 def read_index_json(extracted_package_directory):
     with open(join(extracted_package_directory, 'info', 'index.json')) as fi:
-        record = IndexRecord(**json.load(fi))  # TODO: change to LinkedPackageData
+        record = IndexJsonRecord(**json.load(fi))
+    return record
+
+
+def read_index_json_from_tarball(package_tarball_full_path):
+    with tarfile.open(package_tarball_full_path) as tf:
+        contents = tf.extractfile('info/index.json').read()
+        return IndexJsonRecord(**json.loads(ensure_text_type(contents)))
+
+
+def read_repodata_json(extracted_package_directory):
+    with open(join(extracted_package_directory, 'info', 'repodata_record.json')) as fi:
+        record = IndexRecord(**json.load(fi))
     return record
 
 
@@ -108,18 +136,22 @@ def read_icondata(extracted_package_directory):
 
 
 def read_package_metadata(extracted_package_directory):
-    package_metadata_path = join(extracted_package_directory, 'info', 'package_metadata.json')
-    if isfile(package_metadata_path):
-        with open(package_metadata_path, 'r') as f:
+    def _paths():
+        yield join(extracted_package_directory, 'info', 'link.json')
+        yield join(extracted_package_directory, 'info', 'package_metadata.json')
+
+    path = first(_paths(), key=isfile)
+    if not path:
+        return None
+    else:
+        with open(path, 'r') as f:
             package_metadata = PackageMetadata(**json.loads(f.read()))
             if package_metadata.package_metadata_version != 1:
                 raise CondaUpgradeError(dals("""
                 The current version of conda is too old to install this package. (This version
-                only supports paths.json schema version 1.)  Please update conda to install
+                only supports link.json schema version 1.)  Please update conda to install
                 this package."""))
         return package_metadata
-    else:
-        return None
 
 
 def read_paths_json(extracted_package_directory):
@@ -155,9 +187,11 @@ def read_paths_json(extracted_package_directory):
                 else:
                     path_info["path_type"] = PathType.hardlink
                 yield PathData(**path_info)
+
+        paths = tuple(read_files_file())
         paths_data = PathsData(
             paths_version=0,
-            paths=read_files_file(),
+            paths=paths,
         )
     return paths_data
 
@@ -184,25 +218,10 @@ def read_has_prefix(path):
         elif len(parts) == 3:
             return ParseResult(parts[0], FileMode(parts[1]), parts[2])
         else:
-            raise RuntimeError("Invalid has_prefix file at path: %s" % path)
+            raise CondaVerificationError("Invalid has_prefix file at path: %s" % path)
+
     parsed_lines = (parse_line(line) for line in yield_lines(path))
     return {pr.filepath: (pr.placeholder, pr.filemode) for pr in parsed_lines}
-
-
-def read_files(path):
-    ParseResult = namedtuple('ParseResult', ('filepath', 'hash', 'bytes', 'type'))
-
-    def parse_line(line):
-        # 'filepath', 'hash', 'bytes', 'type'
-        parts = line.split(',')
-        if len(parts) == 4:
-            return ParseResult(*parts)
-        elif len(parts) == 1:
-            return ParseResult(parts[0], None, None, None)
-        else:
-            raise RuntimeError("Invalid files at path: %s" % path)
-
-    return tuple(parse_line(line) for line in yield_lines(path))
 
 
 def read_no_link(info_dir):

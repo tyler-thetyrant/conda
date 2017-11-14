@@ -17,12 +17,13 @@ log = getLogger(__name__)
 
 def replace_first_api_with_conda(url):
     # replace first occurrence of 'api' with 'conda' in url
-    return re.sub(r'([./])api([./])', r'\1conda\2', url, count=1)
+    return re.sub(r'([./])api([./]|$)', r'\1conda\2', url, count=1)
 
 
 def _get_binstar_token_directory():
     if 'BINSTAR_CONFIG_DIR' in os.environ:
-        return EnvAppDirs('binstar', 'ContinuumIO', os.environ['BINSTAR_CONFIG_DIR']).user_data_dir
+        return EnvAppDirs('binstar', 'ContinuumIO',
+                          os.environ[str('BINSTAR_CONFIG_DIR')]).user_data_dir
     else:
         return AppDirs('binstar', 'ContinuumIO').user_data_dir
 

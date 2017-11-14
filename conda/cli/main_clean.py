@@ -5,92 +5,42 @@
 # Consult LICENSE.txt or http://opensource.org/licenses/BSD-3-Clause.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import os
-import sys
 from collections import defaultdict
+from logging import getLogger
+import os
 from os import listdir, lstat, walk
 from os.path import getsize, isdir, join
+import sys
 
-from .common import add_parser_json, add_parser_yes, confirm_yn, stdout_json
+from ..base.constants import CONDA_TARBALL_EXTENSION
 from ..base.context import context
-from ..exceptions import ArgumentError
-from ..gateways.disk.delete import rm_rf
-from ..utils import human_bytes
-from ..common.compat import CrossPlatformStLink
 
-descr = """
-Remove unused packages and caches.
-"""
-
-example = """
-Examples:
-
-    conda clean --tarballs
-"""
-
-def configure_parser(sub_parsers):
-    p = sub_parsers.add_parser(
-        'clean',
-        description=descr,
-        help=descr,
-        epilog=example,
-    )
-    add_parser_yes(p)
-    add_parser_json(p)
-    p.add_argument(
-        "-a", "--all",
-        action="store_true",
-        help="Remove index cache, lock files, tarballs, "
-             "unused cache packages, and source cache.",
-    )
-    p.add_argument(
-        "-i", "--index-cache",
-        action="store_true",
-        help="Remove index cache.",
-    )
-    p.add_argument(
-        "-l", "--lock",
-        action="store_true",
-        help="Remove all conda lock files.",
-    )
-    p.add_argument(
-        "-t", "--tarballs",
-        action="store_true",
-        help="Remove cached package tarballs.",
-    )
-    p.add_argument(
-        '-p', '--packages',
-        action='store_true',
-        help="""Remove unused cached packages. Warning: this does not check
-    for symlinked packages.""",
-    )
-    p.add_argument(
-        '-s', '--source-cache',
-        action='store_true',
-        help="""Remove files from the source cache of conda build.""",
-    )
-    p.set_defaults(func=execute)
+log = getLogger(__name__)
 
 
 def find_tarballs():
+    from ..core.package_cache import PackageCache
     pkgs_dirs = defaultdict(list)
-    for pkgs_dir in context.pkgs_dirs:
+    totalsize = 0
+    part_ext = CONDA_TARBALL_EXTENSION + '.part'
+    for package_cache in PackageCache.writable_caches(context.pkgs_dirs):
+        pkgs_dir = package_cache.pkgs_dir
         if not isdir(pkgs_dir):
             continue
-        for fn in os.listdir(pkgs_dir):
-            if fn.endswith('.tar.bz2') or fn.endswith('.tar.bz2.part'):
+        root, _, filenames = next(os.walk(pkgs_dir))
+        for fn in filenames:
+            if fn.endswith(CONDA_TARBALL_EXTENSION) or fn.endswith(part_ext):
                 pkgs_dirs[pkgs_dir].append(fn)
-
-    totalsize = 0
-    for pkgs_dir in pkgs_dirs:
-        for fn in pkgs_dirs[pkgs_dir]:
-            size = getsize(join(pkgs_dir, fn))
-            totalsize += size
+                totalsize += getsize(join(root, fn))
 
     return pkgs_dirs, totalsize
 
 
 def rm_tarballs(args, pkgs_dirs, totalsize, verbose=True):
+    from .common import confirm_yn
+    from ..gateways.disk.delete import rm_rf
+    from ..utils import human_bytes
+
     if verbose:
         for pkgs_dir in pkgs_dirs:
             print('Cache location: %s' % pkgs_dir)
@@ -116,20 +66,25 @@ def rm_tarballs(args, pkgs_dirs, totalsize, verbose=True):
         print(fmt % ('Total:', human_bytes(totalsize)))
         print()
 
-    if not context.json:
-        confirm_yn(args)
+    if not context.json or not context.always_yes:
+        confirm_yn()
     if context.json and args.dry_run:
         return
 
     for pkgs_dir in pkgs_dirs:
         for fn in pkgs_dirs[pkgs_dir]:
-            if os.access(os.path.join(pkgs_dir, fn), os.W_OK):
+            try:
+                if rm_rf(os.path.join(pkgs_dir, fn)):
+                    if verbose:
+                        print("Removed %s" % fn)
+                else:
+                    if verbose:
+                        print("WARNING: cannot remove, file permissions: %s" % fn)
+            except (IOError, OSError) as e:
                 if verbose:
-                    print("Removing %s" % fn)
-                rm_rf(os.path.join(pkgs_dir, fn))
-            else:
-                if verbose:
-                    print("WARNING: cannot remove, file permissions: %s" % fn)
+                    print("WARNING: cannot remove, file permissions: %s\n%r" % (fn, e))
+                else:
+                    log.info("%r", e)
 
 
 def find_pkgs():
@@ -137,11 +92,13 @@ def find_pkgs():
     # themselves, like bin/python3.3 and bin/python3.3m in the Python package
     warnings = []
 
+    from ..gateways.disk.link import CrossPlatformStLink
     cross_platform_st_nlink = CrossPlatformStLink()
     pkgs_dirs = defaultdict(list)
     for pkgs_dir in context.pkgs_dirs:
         if not os.path.exists(pkgs_dir):
-            print("WARNING: {0} does not exist".format(pkgs_dir))
+            if not context.json:
+                print("WARNING: {0} does not exist".format(pkgs_dir))
             continue
         pkgs = [i for i in listdir(pkgs_dir)
                 if (isdir(join(pkgs_dir, i)) and  # only include actual packages
@@ -149,8 +106,6 @@ def find_pkgs():
         for pkg in pkgs:
             breakit = False
             for root, dir, files in walk(join(pkgs_dir, pkg)):
-                if breakit:
-                    break
                 for fn in files:
                     try:
                         st_nlink = cross_platform_st_nlink(join(root, fn))
@@ -161,6 +116,9 @@ def find_pkgs():
                         # print('%s is installed: %s' % (pkg, join(root, fn)))
                         breakit = True
                         break
+
+                if breakit:
+                    break
             else:
                 pkgs_dirs[pkgs_dir].append(pkg)
 
@@ -181,8 +139,10 @@ def find_pkgs():
     return pkgs_dirs, warnings, totalsize, pkgsizes
 
 
-def rm_pkgs(args, pkgs_dirs, warnings, totalsize, pkgsizes,
-            verbose=True):
+def rm_pkgs(args, pkgs_dirs, warnings, totalsize, pkgsizes, verbose=True):
+    from .common import confirm_yn
+    from ..gateways.disk.delete import rm_rf
+    from ..utils import human_bytes
     if verbose:
         for pkgs_dir in pkgs_dirs:
             print('Cache location: %s' % pkgs_dir)
@@ -208,8 +168,8 @@ def rm_pkgs(args, pkgs_dirs, warnings, totalsize, pkgsizes,
         print(fmt % ('Total:', human_bytes(totalsize)))
         print()
 
-    if not context.json:
-        confirm_yn(args)
+    if not context.json or not context.always_yes:
+        confirm_yn()
     if context.json and args.dry_run:
         return
 
@@ -221,9 +181,10 @@ def rm_pkgs(args, pkgs_dirs, warnings, totalsize, pkgsizes,
 
 
 def rm_index_cache():
-    from conda.install import rm_rf
-
-    rm_rf(join(context.pkgs_dirs[0], 'cache'))
+    from ..gateways.disk.delete import rm_rf
+    from ..core.package_cache import PackageCache
+    for package_cache in PackageCache.writable_caches():
+        rm_rf(join(package_cache.pkgs_dir, 'cache'))
 
 
 def find_source_cache():
@@ -254,31 +215,38 @@ def find_source_cache():
 
 
 def rm_source_cache(args, cache_dirs, warnings, cache_sizes, total_size):
-    verbose = not context.json
+    from .common import confirm_yn
+    from ..gateways.disk.delete import rm_rf
+    from ..utils import human_bytes
+
+    verbose = not (context.json or context.quiet)
     if warnings:
         if verbose:
             for warning in warnings:
                 print(warning, file=sys.stderr)
         return
 
-    for cache_type in cache_dirs:
-        print("%s (%s)" % (cache_type, cache_dirs[cache_type]))
-        print("%-40s %10s" % ("Size:", human_bytes(cache_sizes[cache_type])))
-        print()
+    if verbose:
+        for cache_type in cache_dirs:
+            print("%s (%s)" % (cache_type, cache_dirs[cache_type]))
+            print("%-40s %10s" % ("Size:", human_bytes(cache_sizes[cache_type])))
+            print()
 
-    print("%-40s %10s" % ("Total:", human_bytes(total_size)))
+        print("%-40s %10s" % ("Total:", human_bytes(total_size)))
 
-    if not context.json:
-        confirm_yn(args)
+    if not context.json or not context.always_yes:
+        confirm_yn()
     if context.json and args.dry_run:
         return
 
     for dir in cache_dirs.values():
-        print("Removing %s" % dir)
+        if verbose:
+            print("Removing %s" % dir)
         rm_rf(dir)
 
 
 def execute(args, parser):
+    from .common import stdout_json
     json_result = {
         'success': True
     }
@@ -292,7 +260,7 @@ def execute(args, parser):
             'files': pkgs_dirs[first],  # Backwards compatibility
             'total_size': totalsize
         }
-        rm_tarballs(args, pkgs_dirs, totalsize, verbose=not context.json)
+        rm_tarballs(args, pkgs_dirs, totalsize, verbose=not (context.json or context.quiet))
 
     if args.index_cache or args.all:
         json_result['index_cache'] = {
@@ -312,7 +280,7 @@ def execute(args, parser):
             'pkg_sizes': {i: dict(zip(pkgs_dirs[i], pkgsizes[i])) for i in pkgs_dirs},
         }
         rm_pkgs(args, pkgs_dirs,  warnings, totalsize, pkgsizes,
-                verbose=not context.json)
+                verbose=not (context.json or context.quiet))
 
     if args.source_cache or args.all:
         json_result['source_cache'] = find_source_cache()
@@ -320,6 +288,7 @@ def execute(args, parser):
 
     if not any((args.lock, args.tarballs, args.index_cache, args.packages,
                 args.source_cache, args.all)):
+        from ..exceptions import ArgumentError
         raise ArgumentError("One of {--lock, --tarballs, --index-cache, --packages, "
                             "--source-cache, --all} required")
 

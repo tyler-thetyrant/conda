@@ -1,31 +1,39 @@
 """
 Helpers for the tests
 """
-from __future__ import print_function, division, absolute_import
+from __future__ import absolute_import, division, print_function
 
-import subprocess
-import sys
-import os
-import re
+from collections import defaultdict
+from contextlib import contextmanager
 import json
+import os
+from os.path import dirname, join
+import re
 from shlex import split
+import sys
+from tempfile import gettempdir
+from uuid import uuid4
 
-from conda.base.context import reset_context
-from conda.common.io import captured, argv, replace_log_streams
-from conda.gateways.logging import initialize_logging
 from conda import cli
+from conda._vendor.auxlib.decorators import memoize
+from conda.base.context import context, reset_context
+from conda.common.compat import iteritems, itervalues
+from conda.common.io import argv, captured, captured as common_io_captured, env_var
+from conda.core.repodata import SubdirData, make_feature_record
+from conda.gateways.disk.delete import rm_rf
+from conda.gateways.disk.read import lexists
+from conda.gateways.logging import initialize_logging
+from conda.models.channel import Channel
+from conda.models.dist import Dist
+from conda.models.index_record import IndexRecord
+from conda.resolve import Resolve
 
 try:
     from unittest import mock
+    from unittest.mock import patch
 except ImportError:
-    try:
-        import mock
-    except ImportError:
-        mock = None
-
-from contextlib import contextmanager
-
-from conda.common.compat import StringIO, iteritems
+    import mock
+    from mock import patch
 
 expected_error_prefix = 'Using Anaconda Cloud api site https://api.anaconda.org'
 def strip_expected(stderr):
@@ -44,65 +52,19 @@ def raises(exception, func, string=None):
     raise Exception("did not raise, gave %s" % a)
 
 
-def run_conda_command(*args):
-    # used in tests_config (31 times) and test_info (6 times)
-    env = {str(k): str(v) for k, v in iteritems(os.environ)}
-    p = subprocess.Popen((sys.executable, "-m", "conda") + args, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, env=env)
-
-    stdout, stderr = [stream.strip()
-                          .decode('utf-8')
-                          .replace('\r\n', '\n')
-                          .replace('\\\\', '\\')
-                          .replace("Using Anaconda API: https://api.anaconda.org\n", "")
-                      for stream in p.communicate()]
-    print(stdout)
-    print(stderr, file=sys.stderr)
-    # assert p.returncode == 0, p.returncode
-    if args[0] == 'config':
-        reset_context([args[2]])
-    return stdout, strip_expected(stderr)
-
-
-class CapturedText(object):
-    pass
-
-
 @contextmanager
 def captured(disallow_stderr=True):
-    """
-    Context manager to capture the printed output of the code in the with block
-
-    Bind the context manager to a variable using `as` and the result will be
-    in the stdout property.
-
-    >>> from tests.helpers import captured
-    >>> with captured() as c:
-    ...     print('hello world!')
-    ...
-    >>> c.stdout
-    'hello world!\n'
-    """
-    import sys
-
-    stdout = sys.stdout
-    stderr = sys.stderr
-    sys.stdout = outfile = StringIO()
-    sys.stderr = errfile = StringIO()
-    c = CapturedText()
+    # same as common.io.captured but raises Exception if unexpected output was written to stderr
     try:
-        yield c
+        with common_io_captured() as c:
+            yield c
     finally:
-        c.stdout = outfile.getvalue()
-        c.stderr = strip_expected(errfile.getvalue())
-        sys.stdout = stdout
-        sys.stderr = stderr
+        c.stderr = strip_expected(c.stderr)
         if disallow_stderr and c.stderr:
             raise Exception("Got stderr output: %s" % c.stderr)
 
 
 def capture_json_with_argv(command, **kwargs):
-    # used in test_config (6 times), test_info (2 times), test_list (5 times), and test_search (10 times)
     stdout, stderr, exit_code = run_inprocess_conda_command(command)
     if kwargs.get('relaxed'):
         match = re.match('\A.*?({.*})', stdout, re.DOTALL)
@@ -131,8 +93,9 @@ def assert_in(a, b, output=""):
 
 
 def run_inprocess_conda_command(command):
+    # anything that uses this function is an integration test
     reset_context(())
-    with argv(split(command)), captured() as c, replace_log_streams():
+    with argv(split(command)), captured() as c:
         initialize_logging()
         try:
             exit_code = cli.main()
@@ -141,3 +104,155 @@ def run_inprocess_conda_command(command):
     print(c.stderr, file=sys.stderr)
     print(c.stdout)
     return c.stdout, c.stderr, exit_code
+
+
+@contextmanager
+def tempdir():
+    tempdirdir = gettempdir()
+    dirname = str(uuid4())[:8]
+    prefix = join(tempdirdir, dirname)
+    try:
+        os.makedirs(prefix)
+        yield prefix
+    finally:
+        if lexists(prefix):
+            rm_rf(prefix)
+
+
+def supplement_index_with_repodata(index, repodata, channel, priority):
+    repodata_info = repodata['info']
+    arch = repodata_info.get('arch')
+    platform = repodata_info.get('platform')
+    subdir = repodata_info.get('subdir')
+    if not subdir:
+        subdir = "%s-%s" % (repodata_info['platform'], repodata_info['arch'])
+    auth = channel.auth
+    for fn, info in iteritems(repodata['packages']):
+        rec = IndexRecord.from_objects(info,
+                                       fn=fn,
+                                       arch=arch,
+                                       platform=platform,
+                                       channel=channel,
+                                       subdir=subdir,
+                                       # schannel=schannel,
+                                       priority=priority,
+                                       # url=join_url(channel_url, fn),
+                                       auth=auth)
+        dist = Dist(rec)
+        index[dist] = rec
+
+
+def add_feature_records(index):
+    all_features = defaultdict(set)
+    for rec in itervalues(index):
+        for k, v in iteritems(rec.requires_features):
+            all_features[k].add(v)
+        for k, v in iteritems(rec.provides_features):
+            all_features[k].add(v)
+
+    for feature_name, feature_values in iteritems(all_features):
+        for feature_value in feature_values:
+            rec = make_feature_record(feature_name, feature_value)
+            index[Dist(rec)] = rec
+
+
+@memoize
+def get_index_r_1():
+    with open(join(dirname(__file__), 'index.json')) as fi:
+        packages = json.load(fi)
+        repodata = {
+            "info": {
+                "subdir": context.subdir,
+                "arch": context.arch_name,
+                "platform": context.platform,
+            },
+            "packages": packages,
+        }
+
+    channel = Channel('https://conda.anaconda.org/channel-1/%s' % context.subdir)
+    sd = SubdirData(channel)
+    with env_var("CONDA_ADD_PIP_AS_PYTHON_DEPENDENCY", "false", reset_context):
+        sd._process_raw_repodata_str(json.dumps(repodata))
+    sd._loaded = True
+    SubdirData._cache_[channel.url(with_credentials=True)] = sd
+
+    index = {Dist(prec): prec for prec in sd._package_records}
+    add_feature_records(index)
+    r = Resolve(index, channels=(channel,))
+    return index, r
+
+
+@memoize
+def get_index_r_2():
+    with open(join(dirname(__file__), 'index2.json')) as fi:
+        packages = json.load(fi)
+        repodata = {
+            "info": {
+                "subdir": context.subdir,
+                "arch": context.arch_name,
+                "platform": context.platform,
+            },
+            "packages": packages,
+        }
+
+    channel = Channel('https://conda.anaconda.org/channel-2/%s' % context.subdir)
+    sd = SubdirData(channel)
+    with env_var("CONDA_ADD_PIP_AS_PYTHON_DEPENDENCY", "false", reset_context):
+        sd._process_raw_repodata_str(json.dumps(repodata))
+    sd._loaded = True
+    SubdirData._cache_[channel.url(with_credentials=True)] = sd
+
+    index = {Dist(prec): prec for prec in sd._package_records}
+    r = Resolve(index, channels=(channel,))
+    return index, r
+
+
+@memoize
+def get_index_r_3():
+    with open(join(dirname(__file__), 'index3.json')) as fi:
+        packages = json.load(fi)
+        repodata = {
+            "info": {
+                "subdir": context.subdir,
+                "arch": context.arch_name,
+                "platform": context.platform,
+            },
+            "packages": packages,
+        }
+
+    channel = Channel('https://conda.anaconda.org/channel-3/%s' % context.subdir)
+    sd = SubdirData(channel)
+    with env_var("CONDA_ADD_PIP_AS_PYTHON_DEPENDENCY", "false", reset_context):
+        sd._process_raw_repodata_str(json.dumps(repodata))
+    sd._loaded = True
+    SubdirData._cache_[channel.url(with_credentials=True)] = sd
+
+    index = {Dist(prec): prec for prec in sd._package_records}
+    r = Resolve(index, channels=(channel,))
+    return index, r
+
+
+@memoize
+def get_index_r_4():
+    with open(join(dirname(__file__), 'index4.json')) as fi:
+        packages = json.load(fi)
+        repodata = {
+            "info": {
+                "subdir": context.subdir,
+                "arch": context.arch_name,
+                "platform": context.platform,
+            },
+            "packages": packages,
+        }
+
+    channel = Channel('https://conda.anaconda.org/channel-4/%s' % context.subdir)
+    sd = SubdirData(channel)
+    with env_var("CONDA_ADD_PIP_AS_PYTHON_DEPENDENCY", "false", reset_context):
+        sd._process_raw_repodata_str(json.dumps(repodata))
+    sd._loaded = True
+    SubdirData._cache_[channel.url(with_credentials=True)] = sd
+
+    index = {Dist(prec): prec for prec in sd._package_records}
+    r = Resolve(index, channels=(channel,))
+
+    return index, r

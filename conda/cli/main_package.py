@@ -1,6 +1,3 @@
-# (c) Continuum Analytics, Inc. / http://continuum.io
-# All Rights Reserved
-#
 # conda is distributed under the terms of the BSD 3-clause license.
 # Consult LICENSE.txt or http://opensource.org/licenses/BSD-3-Clause.
 
@@ -12,69 +9,19 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import hashlib
 import json
 import os
+from os.path import abspath, basename, dirname, isdir, isfile, islink, join
 import re
-import shutil
 import tarfile
 import tempfile
-from conda._vendor.auxlib.entity import EntityEncoder
-from conda.core.linked_data import is_linked, linked_data
-from conda.core.linked_data import linked
-from os.path import basename, dirname, isfile, islink, join, abspath, isdir
 
-from ..base.context import context, get_prefix
-
-from .common import add_parser_prefix
+from .._vendor.auxlib.entity import EntityEncoder
+from ..base.context import context
 from ..common.compat import PY3, itervalues
+from ..common.path import paths_equal
+from ..core.linked_data import is_linked, linked, linked_data
+from ..gateways.disk.delete import rmtree
 from ..install import PREFIX_PLACEHOLDER
 from ..misc import untracked
-
-
-descr = "Low-level conda package utility. (EXPERIMENTAL)"
-
-
-def configure_parser(sub_parsers):
-    p = sub_parsers.add_parser(
-        'package',
-        description=descr,
-        help=descr,
-    )
-    add_parser_prefix(p)
-    p.add_argument(
-        '-w', "--which",
-        metavar="PATH",
-        nargs='+',
-        action="store",
-        help="Given some PATH print which conda package the file came from.",
-    )
-    p.add_argument(
-        '-r', "--reset",
-        action="store_true",
-        help="Remove all untracked files and exit.",
-    )
-    p.add_argument(
-        '-u', "--untracked",
-        action="store_true",
-        help="Display all untracked files and exit.",
-    )
-    p.add_argument(
-        "--pkg-name",
-        action="store",
-        default="unknown",
-        help="Package name of the created package.",
-    )
-    p.add_argument(
-        "--pkg-version",
-        action="store",
-        default="0.0",
-        help="Package version of the created package.",
-    )
-    p.add_argument(
-        "--pkg-build",
-        action="store",
-        default=0,
-        help="Package build number of the created package.",
-    )
-    p.set_defaults(func=execute)
 
 
 def remove(prefix, files):
@@ -95,7 +42,8 @@ def remove(prefix, files):
 
 
 def execute(args, parser):
-    prefix = get_prefix(context, args)
+
+    prefix = context.target_prefix
 
     if args.which:
         for path in args.which:
@@ -224,7 +172,7 @@ def create_conda_pkg(prefix, files, info, tar_path, update_info=None):
         update_info(info)
     _add_info_dir(t, tmp_dir, files, has_prefix, info)
     t.close()
-    shutil.rmtree(tmp_dir)
+    rmtree(tmp_dir)
     return warnings
 
 
@@ -261,10 +209,12 @@ def which_package(path):
     path = abspath(path)
     prefix = which_prefix(path)
     if prefix is None:
-        raise RuntimeError("could not determine conda prefix from: %s" % path)
+        from ..exceptions import CondaVerificationError
+        raise CondaVerificationError("could not determine conda prefix from: %s" % path)
+
     for dist in linked(prefix):
         meta = is_linked(prefix, dist)
-        if any(abspath(join(prefix, f)) == path for f in meta['files']):
+        if any(paths_equal(join(prefix, f), path) for f in meta['files']):
             yield dist
 
 

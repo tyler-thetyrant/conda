@@ -2,12 +2,9 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from contextlib import contextmanager
-from logging import getLogger
 from os import makedirs, unlink
 from os.path import isdir
 from tempfile import NamedTemporaryFile
-
-log = getLogger(__name__)
 
 
 def conda_bld_ensure_dir(path):
@@ -16,7 +13,7 @@ def conda_bld_ensure_dir(path):
     if not isdir(path):
         try:
             makedirs(path)
-        except OSError:
+        except OSError:  # pragma: no cover
             pass
 
 

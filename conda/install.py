@@ -1,6 +1,3 @@
-# (c) 2012-2014 Continuum Analytics, Inc. / http://continuum.io
-# All Rights Reserved
-#
 # conda is distributed under the terms of the BSD 3-clause license.
 # Consult LICENSE.txt or http://opensource.org/licenses/BSD-3-Clause.
 """ This module contains:
@@ -21,15 +18,15 @@ These API functions have argument names referring to:
 """
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+from errno import EACCES, EEXIST, ENOENT, EPERM, EROFS
 import functools
 import logging
 import os
-from errno import EACCES, EEXIST, EPERM, EROFS
 from os import chmod, makedirs, stat
 from os.path import dirname, isdir, isfile, join, normcase, normpath
 
 from .base.constants import PREFIX_PLACEHOLDER
-from .common.compat import on_win
+from .common.compat import on_win, open
 from .gateways.disk.delete import delete_trash, move_path_to_trash, rm_rf
 delete_trash, move_path_to_trash = delete_trash, move_path_to_trash
 from .core.linked_data import is_linked, linked, linked_data  # NOQA
@@ -38,8 +35,6 @@ from .core.package_cache import rm_fetched  # NOQA
 rm_fetched = rm_fetched
 
 log = logging.getLogger(__name__)
-stdoutlog = logging.getLogger('stdoutlog')
-
 
 # backwards compatibility for conda-build
 prefix_placeholder = PREFIX_PLACEHOLDER
@@ -47,11 +42,11 @@ prefix_placeholder = PREFIX_PLACEHOLDER
 
 # backwards compatibility for conda-build
 def package_cache():
-    log.warn('package_cache() is a no-op and deprecated')
-    return {}
+    from .core.package_cache import package_cache
+    return package_cache()
 
 
-if on_win:
+if on_win:  # pragma: no cover
     def win_conda_bat_redirect(src, dst, shell):
         """Special function for Windows XP where the `CreateSymbolicLink`
         function is not available.
@@ -61,7 +56,7 @@ if on_win:
 
         Works of course only with callable files, e.g. `.bat` or `.exe` files.
         """
-        from conda.utils import shells
+        from .utils import shells
         try:
             makedirs(dirname(dst))
         except OSError as exc:  # Python >2.5
@@ -98,7 +93,7 @@ if on_win:
 
 
 # Should this be an API function?
-def symlink_conda(prefix, root_dir, shell=None):
+def symlink_conda(prefix, root_dir, shell=None):  # pragma: no cover
     # do not symlink root env - this clobbers activate incorrectly.
     # prefix should always be longer than, or outside the root dir.
     if normcase(normpath(prefix)) in normcase(normpath(root_dir)):
@@ -114,7 +109,7 @@ def symlink_conda(prefix, root_dir, shell=None):
     symlink_conda_hlp(prefix, root_dir, where, symlink_fn)
 
 
-def symlink_conda_hlp(prefix, root_dir, where, symlink_fn):
+def symlink_conda_hlp(prefix, root_dir, where, symlink_fn):  # pragma: no cover
     scripts = ["conda", "activate", "deactivate"]
     prefix_where = join(prefix, where)
     if not isdir(prefix_where):
@@ -134,5 +129,11 @@ def symlink_conda_hlp(prefix, root_dir, where, symlink_fn):
                     (e.errno in (EPERM, EACCES, EROFS, EEXIST))):
                 log.debug("Cannot symlink {0} to {1}. Ignoring since link already exists."
                           .format(root_file, prefix_file))
+            elif e.errno == ENOENT:
+                log.debug("Problem with symlink management {0} {1}. File may have been removed by "
+                          "another concurrent process." .format(root_file, prefix_file))
+            elif e.errno == EEXIST:
+                log.debug("Problem with symlink management {0} {1}. File may have been created by "
+                          "another concurrent process." .format(root_file, prefix_file))
             else:
                 raise

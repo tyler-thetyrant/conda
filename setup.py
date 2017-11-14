@@ -23,7 +23,8 @@ WARNING: Your current install method for conda only supports conda
 as a python library.  You are not installing a conda executable command
 or activate/deactivate commands.  If your intention is to install conda
 as a standalone application, currently supported install methods include
-the Anaconda installer and the miniconda installer.
+the Anaconda installer and the miniconda installer.  If you'd still like
+for setup.py to create entry points for you, use `utils/setup-testing.py`.
 """, file=sys.stderr)
 
 
@@ -33,17 +34,42 @@ src_dir = here = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, src_dir)
 import conda._vendor.auxlib.packaging  # NOQA
 
+long_description = """
+.. image:: https://s3.amazonaws.com/conda-dev/conda_logo.svg
+   :alt: Conda Logo
 
-with open(os.path.join(src_dir, "README.rst")) as f:
-    long_description = f.read()
+Conda is a cross-platform, language-agnostic binary package manager. It is the
+package manager used by `Anaconda
+<http://docs.continuum.io/anaconda/index.html>`_ installations, but it may be
+used for other systems as well.  Conda makes environments first-class
+citizens, making it easy to create independent environments even for C
+libraries. Conda is written entirely in Python, and is BSD licensed open
+source.
+
+
+Installation
+############
+
+**WARNING:** Using ``pip install conda`` or ``easy_install conda`` will not
+give you conda as a standalone application.  Currently supported install
+methods include the Anaconda installer and the miniconda installer.  You
+can download the miniconda installer from https://conda.io/miniconda.html.
+
+"""
 
 install_requires = [
-    'pycosat >=0.6.1',
-    'requests >=2.5.3',
+    'pycosat >=0.6.3',
+    'requests >=2.12.4',
+    'ruamel.yaml >=0.11.14'
 ]
+
 
 if sys.version_info < (3, 4):
     install_requires.append('enum34')
+
+
+if sys.platform == "win32":
+    install_requires.append('menuinst')
 
 
 setup(
@@ -64,6 +90,7 @@ setup(
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.4",
         "Programming Language :: Python :: 3.5",
+        "Programming Language :: Python :: 3.6",
     ],
     packages=conda._vendor.auxlib.packaging.find_packages(exclude=("tests",
                                                                    "tests.*",
@@ -73,6 +100,11 @@ setup(
     cmdclass={
         'build_py': conda._vendor.auxlib.packaging.BuildPyCommand,
         'sdist': conda._vendor.auxlib.packaging.SDistCommand,
+    },
+    entry_points={
+        'console_scripts': [
+            'conda=conda.cli.pip_warning:main',
+        ],
     },
     install_requires=install_requires,
     zip_safe=False,

@@ -1,147 +1,27 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+from copy import copy
 from itertools import chain
 from logging import getLogger
 
-from requests.packages.urllib3.util import Url
-
-from ..base.constants import (DEFAULT_CHANNELS_UNIX, DEFAULT_CHANNELS_WIN, MAX_CHANNEL_PRIORITY,
-                              UNKNOWN_CHANNEL)
+from .._vendor.boltons.setutils import IndexedSet
+from ..base.constants import DEFAULTS_CHANNEL_NAME, MAX_CHANNEL_PRIORITY, UNKNOWN_CHANNEL
 from ..base.context import context
-from ..common.compat import iteritems, odict, with_metaclass
-from ..common.path import is_windows_path
-from ..common.url import (has_scheme, is_url, join_url, on_win, path_to_url,
-                          split_conda_url_easy_parts, split_scheme_auth_token, urlparse)
+from ..common.compat import ensure_text_type, isiterable, iteritems, odict, with_metaclass
+from ..common.path import is_path, win_path_backout
+from ..common.url import (Url, has_scheme, is_url, join_url, path_to_url,
+                          split_conda_url_easy_parts, split_platform, split_scheme_auth_token,
+                          urlparse)
 
 try:
     from cytoolz.functoolz import excepts
-    from cytoolz.itertoolz import concatv, topk
-except ImportError:
+    from cytoolz.itertoolz import concat, concatv, drop
+except ImportError:  # pragma: no cover
     from .._vendor.toolz.functoolz import excepts  # NOQA
-    from .._vendor.toolz.itertoolz import concatv, topk  # NOQA
+    from .._vendor.toolz.itertoolz import concat, concatv, drop  # NOQA
 
 log = getLogger(__name__)
-
-
-# backward compatibility for conda-build
-def get_conda_build_local_url():
-    return context.local_build_root,
-
-
-def tokenized_startswith(test_iterable, startswith_iterable):
-    return all(t == sw for t, sw in zip(test_iterable, startswith_iterable))
-
-
-def tokenized_conda_url_startswith(test_url, startswith_url):
-    test_url, startswith_url = urlparse(test_url), urlparse(startswith_url)
-    if test_url.host != startswith_url.host or test_url.port != startswith_url.port:
-        return False
-    norm_url_path = lambda url: url.path.strip('/') or '/'
-    return tokenized_startswith(norm_url_path(test_url).split('/'),
-                                norm_url_path(startswith_url).split('/'))
-
-
-def _get_channel_for_name(channel_name):
-    def _get_channel_for_name_helper(name):
-        if name in context.custom_channels:
-            return context.custom_channels[name]
-        else:
-            test_name = name.rsplit('/', 1)[0]  # progressively strip off path segments
-            if test_name == name:
-                return None
-            return _get_channel_for_name_helper(test_name)
-
-    channel = _get_channel_for_name_helper(channel_name)
-
-    if channel is not None:
-        # stripping off path threw information away from channel_name (i.e. any potential subname)
-        # channel.name *should still be* channel_name
-        channel.name = channel_name
-        return channel
-    else:
-        ca = context.channel_alias
-        return Channel(scheme=ca.scheme, auth=ca.auth, location=ca.location, token=ca.token,
-                       name=channel_name)
-
-
-def _read_channel_configuration(scheme, host, port, path):
-    # return location, name, scheme, auth, token
-
-    path = path and path.rstrip('/')
-    test_url = Url(host=host, port=port, path=path).url
-
-    # Step 1. No path given; channel name is None
-    if not path:
-        return Url(host=host, port=port).url.rstrip('/'), None, scheme or None, None, None
-
-    # Step 2. migrated_custom_channels matches
-    for name, location in sorted(context.migrated_custom_channels.items(), reverse=True,
-                                 key=lambda x: len(x[0])):
-        location, _scheme, _auth, _token = split_scheme_auth_token(location)
-        if tokenized_conda_url_startswith(test_url, join_url(location, name)):
-            # translate location to new location, with new credentials
-            subname = test_url.replace(join_url(location, name), '', 1).strip('/')
-            channel_name = join_url(name, subname)
-            channel = _get_channel_for_name(channel_name)
-            return channel.location, channel_name, channel.scheme, channel.auth, channel.token
-
-    # Step 3. migrated_channel_aliases matches
-    for migrated_alias in context.migrated_channel_aliases:
-        if test_url.startswith(migrated_alias.location):
-            name = test_url.replace(migrated_alias.location, '', 1).strip('/')
-            ca = context.channel_alias
-            return ca.location, name, ca.scheme, ca.auth, ca.token
-
-    # Step 4. custom_channels matches
-    for name, channel in sorted(context.custom_channels.items(), reverse=True,
-                                key=lambda x: len(x[0])):
-        that_test_url = join_url(channel.location, channel.name)
-        if test_url.startswith(that_test_url):
-            subname = test_url.replace(that_test_url, '', 1).strip('/')
-            return (channel.location, join_url(channel.name, subname), scheme,
-                    channel.auth, channel.token)
-
-    # Step 5. channel_alias match
-    ca = context.channel_alias
-    if ca.location and test_url.startswith(ca.location):
-        name = test_url.replace(ca.location, '', 1).strip('/') or None
-        return ca.location, name, scheme, ca.auth, ca.token
-
-    # Step 6. not-otherwise-specified file://-type urls
-    if host is None:
-        # this should probably only happen with a file:// type url
-        assert port is None
-        location, name = test_url.rsplit('/', 1)
-        if not location:
-            location = '/'
-        _scheme, _auth, _token = 'file', None, None
-        return location, name, _scheme, _auth, _token
-
-    # Step 7. fall through to host:port as channel_location and path as channel_name
-    return (Url(host=host, port=port).url.rstrip('/'), path.strip('/') or None,
-            scheme or None, None, None)
-
-
-def parse_conda_channel_url(url):
-    (scheme, auth, token, platform, package_filename,
-     host, port, path, query) = split_conda_url_easy_parts(url)
-
-    # recombine host, port, path to get a channel_name and channel_location
-    (channel_location, channel_name, configured_scheme, configured_auth,
-     configured_token) = _read_channel_configuration(scheme, host, port, path)
-
-    # if we came out with no channel_location or channel_name, we need to figure it out
-    # from host, port, path
-    assert channel_location is not None or channel_name is not None
-
-    return Channel(configured_scheme or 'https',
-                   auth or configured_auth,
-                   channel_location,
-                   token or configured_token,
-                   channel_name,
-                   platform,
-                   package_filename)
 
 
 class ChannelType(type):
@@ -161,7 +41,14 @@ class ChannelType(type):
                 c = Channel._cache_[value] = Channel.from_value(value)
                 return c
         else:
-            return super(ChannelType, cls).__call__(*args, **kwargs)
+            if 'channels' in kwargs:
+                # presence of 'channels' kwarg indicates MultiChannel
+                name = kwargs['name']
+                channels = tuple(super(ChannelType, cls).__call__(**_kwargs)
+                                 for _kwargs in kwargs['channels'])
+                return MultiChannel(name, channels)
+            else:
+                return super(ChannelType, cls).__call__(*args, **kwargs)
 
 
 @with_metaclass(ChannelType)
@@ -174,11 +61,11 @@ class Channel(object):
     channel <> subchannel <> namespace <> package_name
 
     """
-    _cache_ = dict()
+    _cache_ = {}
 
     @staticmethod
     def _reset_state():
-        Channel._cache_ = dict()
+        Channel._cache_ = {}
 
     def __init__(self, scheme=None, auth=None, location=None, token=None, name=None,
                  platform=None, package_filename=None):
@@ -198,6 +85,10 @@ class Channel(object):
     def channel_name(self):
         return self.name
 
+    @property
+    def subdir(self):
+        return self.platform
+
     @staticmethod
     def from_url(url):
         return parse_conda_channel_url(url)
@@ -208,25 +99,25 @@ class Channel(object):
 
     @staticmethod
     def from_value(value):
-        if value is None:
+        if value in (None, '<unknown>', 'None:///<unknown>', 'None'):
             return Channel(name=UNKNOWN_CHANNEL)
-        if hasattr(value, 'decode'):
-            value = value.decode('utf-8')
+        value = ensure_text_type(value)
         if has_scheme(value):
-            if value.startswith('file:') and on_win:
-                value = value.replace('\\', '/')
+            if value.startswith('file:'):
+                value = win_path_backout(value)
             return Channel.from_url(value)
-        elif value.startswith(('./', '..', '~', '/')) or is_windows_path(value):
+        elif is_path(value):
             return Channel.from_url(path_to_url(value))
         elif value.endswith('.tar.bz2'):
-            if value.startswith('file:') and on_win:
-                value = value.replace('\\', '/')
+            if value.startswith('file:'):
+                value = win_path_backout(value)
             return Channel.from_url(value)
         else:
             # at this point assume we don't have a bare (non-scheme) url
             #   e.g. this would be bad:  repo.continuum.io/pkgs/free
-            if value in context.custom_multichannels:
-                return MultiChannel(value, context.custom_multichannels[value])
+            _stripped, platform = split_platform(value, context.known_subdirs)
+            if _stripped in context.custom_multichannels:
+                return MultiChannel(_stripped, context.custom_multichannels[_stripped], platform)
             else:
                 return Channel.from_channel_name(value)
 
@@ -264,10 +155,6 @@ class Channel(object):
                for c in concatv((context.channel_alias,), context.migrated_channel_aliases)):
             return self.name
 
-        # if self.scheme == 'file' and self.package_filename:
-        #     # at this point, the url isn't included in any known local channel names
-        #     return self.get_channel_from_package_cache(self).canonical_name
-
         # fall back to the equivalent of self.base_url
         # re-defining here because base_url for MultiChannel is None
         if self.scheme:
@@ -275,33 +162,15 @@ class Channel(object):
         else:
             return join_url(self.location, self.name).lstrip('/')
 
-    # @staticmethod
-    # def get_channel_from_package_cache(channel):
-    #     assert channel.scheme == 'file', channel.scheme
-    #     assert channel.platform is None, channel.platform
-    #     assert channel.package_filename
-    #
-    #     local_file_dir = join_url(channel.location, channel.name)
-    #
-    #     if win_path_ok(local_file_dir) in context.pkgs_dirs:
-    #         from ..core.package_cache import PackageCache
-    #         package_cache = PackageCache(local_file_dir)
-    #         recorded_url = package_cache.urls_data.get_url(channel.package_filename)
-    #         if recorded_url.startswith('file:/'):
-    #             # make sure path actually is a channel
-    #             _, platform = split_platform(recorded_url)
-    #             if platform:
-    #                 return Channel(recorded_url)
-    #             else:
-    #                 return Channel(None)
-    #         else:
-    #             return Channel(recorded_url)
-    #     else:
-    #         # we can't use the channel name 'local' because that's already taken by conda-build
-    #         #   maybe the path really doesn't have a channel name
-    #         return Channel(None)
+    def urls(self, with_credentials=False, subdirs=None):
+        if subdirs is None:
+            subdirs = context.subdirs
 
-    def urls(self, with_credentials=False, platform=None):
+        assert isiterable(subdirs), subdirs  # subdirs must be a non-string iterable
+
+        if self.canonical_name == UNKNOWN_CHANNEL:
+            return Channel(DEFAULTS_CHANNEL_NAME).urls(with_credentials, subdirs)
+
         base = [self.location]
         if with_credentials and self.token:
             base.extend(['t', self.token])
@@ -309,8 +178,14 @@ class Channel(object):
         base = join_url(*base)
 
         def _platforms():
-            p = platform or self.platform or context.subdir
-            return (p, 'noarch') if p != 'noarch' else ('noarch',)
+            if self.platform:
+                yield self.platform
+                if self.platform != 'noarch':
+                    yield 'noarch'
+            else:
+                for subdir in subdirs:
+                    yield subdir
+
         bases = (join_url(base, p) for p in _platforms())
 
         if with_credentials and self.auth:
@@ -331,7 +206,8 @@ class Channel(object):
             if self.package_filename:
                 base.append(self.package_filename)
         else:
-            base.append(context.subdir)
+            first_non_noarch = next((s for s in context.subdirs if s != 'noarch'), 'noarch')
+            base.append(first_non_noarch)
 
         base = join_url(*base)
 
@@ -342,9 +218,20 @@ class Channel(object):
 
     @property
     def base_url(self):
-        if self.canonical_name is None:
+        if self.canonical_name == UNKNOWN_CHANNEL:
             return None
         return "%s://%s" % (self.scheme, join_url(self.location, self.name))
+
+    @property
+    def base_urls(self):
+        return self.base_url,
+
+    @property
+    def subdir_url(self):
+        url = self.url(True)
+        if self.package_filename and url:
+            url = url.rsplit('/', 1)[0]
+        return url
 
     def __str__(self):
         return self.base_url or ""
@@ -363,7 +250,12 @@ class Channel(object):
         if isinstance(other, Channel):
             return self.location == other.location and self.name == other.name
         else:
-            return False
+            try:
+                _other = Channel(other)
+                return self.location == _other.location and self.name == _other.name
+            except Exception as e:
+                log.debug("%r", e)
+                return False
 
     def __hash__(self):
         return hash((self.location, self.name))
@@ -381,18 +273,35 @@ class Channel(object):
     def url_channel_wtf(self):
         return self.base_url, self.canonical_name
 
+    def dump(self):
+        return {
+            "scheme": self.scheme,
+            "auth": self.auth,
+            "location": self.location,
+            "token": self.token,
+            "name": self.name,
+            "platform": self.platform,
+            "package_filename": self.package_filename,
+        }
+
 
 class MultiChannel(Channel):
 
-    def __init__(self, name, channels):
+    def __init__(self, name, channels, platform=None):
         self.name = name
         self.location = None
-        self._channels = channels
+
+        if platform:
+            c_dicts = tuple(c.dump() for c in channels)
+            any(cd.update(platform=platform) for cd in c_dicts)
+            self._channels = tuple(Channel(**cd) for cd in c_dicts)
+        else:
+            self._channels = channels
 
         self.scheme = None
         self.auth = None
         self.token = None
-        self.platform = None
+        self.platform = platform
         self.package_filename = None
 
     @property
@@ -403,36 +312,180 @@ class MultiChannel(Channel):
     def canonical_name(self):
         return self.name
 
-    def urls(self, with_credentials=False, platform=None):
-        if platform and platform != context.subdir and self.name == 'defaults':
-            # necessary shenanigan because different platforms have different default channels
-            urls = DEFAULT_CHANNELS_WIN if 'win' in platform else DEFAULT_CHANNELS_UNIX
-            ca = context.channel_alias
-            _channels = tuple(Channel.make_simple_channel(ca, v) for v in urls)
-        else:
-            _channels = self._channels
-        return list(chain.from_iterable(c.urls(with_credentials, platform) for c in _channels))
+    def urls(self, with_credentials=False, subdirs=None):
+        _channels = self._channels
+        return list(chain.from_iterable(c.urls(with_credentials, subdirs) for c in _channels))
 
     @property
     def base_url(self):
         return None
 
+    @property
+    def base_urls(self):
+        return tuple(c.base_url for c in self._channels)
+
     def url(self, with_credentials=False):
         return None
 
+    def dump(self):
+        return {
+            "name": self.name,
+            "channels": tuple(c.dump() for c in self._channels)
+        }
 
-def prioritize_channels(channels, with_credentials=True, platform=None):
+
+def tokenized_startswith(test_iterable, startswith_iterable):
+    return all(t == sw for t, sw in zip(test_iterable, startswith_iterable))
+
+
+def tokenized_conda_url_startswith(test_url, startswith_url):
+    test_url, startswith_url = urlparse(test_url), urlparse(startswith_url)
+    if test_url.host != startswith_url.host or test_url.port != startswith_url.port:
+        return False
+    norm_url_path = lambda url: url.path.strip('/') or '/'
+    return tokenized_startswith(norm_url_path(test_url).split('/'),
+                                norm_url_path(startswith_url).split('/'))
+
+
+def _get_channel_for_name(channel_name):
+    def _get_channel_for_name_helper(name):
+        if name in context.custom_channels:
+            return context.custom_channels[name]
+        else:
+            test_name = name.rsplit('/', 1)[0]  # progressively strip off path segments
+            if test_name == name:
+                return None
+            return _get_channel_for_name_helper(test_name)
+
+    _stripped, platform = split_platform(channel_name, context.known_subdirs)
+    channel = _get_channel_for_name_helper(_stripped)
+
+    if channel is not None:
+        # stripping off path threw information away from channel_name (i.e. any potential subname)
+        # channel.name *should still be* channel_name
+        channel = copy(channel)
+        channel.name = channel_name
+        if platform:
+            channel.platform = platform
+        return channel
+    else:
+        ca = context.channel_alias
+        return Channel(scheme=ca.scheme, auth=ca.auth, location=ca.location, token=ca.token,
+                       name=_stripped, platform=platform)
+
+
+def _read_channel_configuration(scheme, host, port, path):
+    # return location, name, scheme, auth, token
+
+    path = path and path.rstrip('/')
+    test_url = Url(host=host, port=port, path=path).url
+
+    # Step 1. No path given; channel name is None
+    if not path:
+        return Url(host=host, port=port).url.rstrip('/'), None, scheme or None, None, None
+
+    # Step 2. migrated_custom_channels matches
+    for name, location in sorted(context.migrated_custom_channels.items(), reverse=True,
+                                 key=lambda x: len(x[0])):
+        location, _scheme, _auth, _token = split_scheme_auth_token(location)
+        if tokenized_conda_url_startswith(test_url, join_url(location, name)):
+            # translate location to new location, with new credentials
+            subname = test_url.replace(join_url(location, name), '', 1).strip('/')
+            channel_name = join_url(name, subname)
+            channel = _get_channel_for_name(channel_name)
+            return channel.location, channel_name, channel.scheme, channel.auth, channel.token
+
+    # Step 3. migrated_channel_aliases matches
+    for migrated_alias in context.migrated_channel_aliases:
+        if test_url.startswith(migrated_alias.location):
+            name = test_url.replace(migrated_alias.location, '', 1).strip('/')
+            ca = context.channel_alias
+            return ca.location, name, ca.scheme, ca.auth, ca.token
+
+    # Step 4. custom_channels matches
+    for name, channel in sorted(context.custom_channels.items(), reverse=True,
+                                key=lambda x: len(x[0])):
+        that_test_url = join_url(channel.location, channel.name)
+        if tokenized_startswith(test_url.split('/'), that_test_url.split('/')):
+            subname = test_url.replace(that_test_url, '', 1).strip('/')
+            return (channel.location, join_url(channel.name, subname), scheme,
+                    channel.auth, channel.token)
+
+    # Step 5. channel_alias match
+    ca = context.channel_alias
+    if ca.location and tokenized_startswith(test_url.split('/'), ca.location.split('/')):
+        name = test_url.replace(ca.location, '', 1).strip('/') or None
+        return ca.location, name, scheme, ca.auth, ca.token
+
+    # Step 6. not-otherwise-specified file://-type urls
+    if host is None:
+        # this should probably only happen with a file:// type url
+        assert port is None
+        location, name = test_url.rsplit('/', 1)
+        if not location:
+            location = '/'
+        _scheme, _auth, _token = 'file', None, None
+        return location, name, _scheme, _auth, _token
+
+    # Step 7. fall through to host:port as channel_location and path as channel_name
+    #  but bump the first token of paths starting with /conda for compatibility with
+    #  Anaconda Enterprise Repository software.
+    bump = None
+    path_parts = path.strip('/').split('/')
+    if path_parts and path_parts[0] == 'conda':
+        bump, path = 'conda', '/'.join(drop(1, path_parts))
+    return (Url(host=host, port=port, path=bump).url.rstrip('/'), path.strip('/') or None,
+            scheme or None, None, None)
+
+
+def parse_conda_channel_url(url):
+    (scheme, auth, token, platform, package_filename,
+     host, port, path, query) = split_conda_url_easy_parts(url, context.known_subdirs)
+
+    # recombine host, port, path to get a channel_name and channel_location
+    (channel_location, channel_name, configured_scheme, configured_auth,
+     configured_token) = _read_channel_configuration(scheme, host, port, path)
+
+    # if we came out with no channel_location or channel_name, we need to figure it out
+    # from host, port, path
+    assert channel_location is not None or channel_name is not None
+
+    return Channel(configured_scheme or 'https',
+                   auth or configured_auth,
+                   channel_location,
+                   token or configured_token,
+                   channel_name,
+                   platform,
+                   package_filename)
+
+
+# backward compatibility for conda-build
+def get_conda_build_local_url():
+    return context.local_build_root,
+
+
+def prioritize_channels(channels, with_credentials=True, subdirs=None):
     # prioritize_channels returns and OrderedDict with platform-specific channel
     #   urls as the key, and a tuple of canonical channel name and channel priority
     #   number as the value
     # ('https://conda.anaconda.org/conda-forge/osx-64/', ('conda-forge', 1))
+    channels = concat((Channel(cc) for cc in c._channels) if isinstance(c, MultiChannel) else (c,)
+                      for c in (Channel(c) for c in channels))
     result = odict()
-    for q, chn in enumerate(channels):
+    for priority_counter, chn in enumerate(channels):
         channel = Channel(chn)
-        for url in channel.urls(with_credentials, platform):
+        for url in channel.urls(with_credentials, subdirs):
             if url in result:
                 continue
-            result[url] = channel.canonical_name, min(q, MAX_CHANNEL_PRIORITY - 1)
+            result[url] = channel.canonical_name, min(priority_counter, MAX_CHANNEL_PRIORITY - 1)
+    return result
+
+
+def all_channel_urls(channels, subdirs=None, with_credentials=True):
+    result = IndexedSet()
+    for chn in channels:
+        channel = Channel(chn)
+        result.update(channel.urls(with_credentials, subdirs))
     return result
 
 

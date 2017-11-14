@@ -1,21 +1,22 @@
 import json
 import os
-import unittest
-import tempfile
 from shlex import split
+import tempfile
+import unittest
 
-from conda_env.exceptions import SpecNotFound
-from conda_env.cli.main import create_parser
+import pytest
 
-from conda.base.context import context
 from conda.base.constants import ROOT_ENV_NAME
-from conda.common.io import captured
-from conda.install import rm_rf
-from conda.cli.main_create import configure_parser as conda_create_parser
-from conda.cli.main_list import configure_parser as list_parser
-from conda.cli.main_info import configure_parser as info_parser
-from conda.cli.main_install import configure_parser as install_parser
+from conda.base.context import context
+from conda.cli.common import list_prefixes
+from conda.cli.conda_argparse import do_call
 from conda.cli.main import generate_parser
+from conda.common.io import captured
+from conda.exceptions import EnvironmentLocationNotFound
+from conda.install import rm_rf
+from conda_env.cli.main import create_parser
+from conda_env.exceptions import SpecNotFound
+from conda_env.yaml import load as yaml_load
 
 environment_1 = '''
 name: env-1
@@ -36,6 +37,7 @@ channels:
 
 test_env_name_1 = "env-1"
 test_env_name_2 = "snowflakes"
+test_env_name_3 = "env_foo"
 
 def escape_for_winpath(p):
     if p:
@@ -87,13 +89,6 @@ def run_env_command(command, prefix, *arguments):
 
     return c.stdout, c.stderr
 
-parser_config = {
-    Commands.CREATE: conda_create_parser,
-    Commands.LIST: list_parser,
-    Commands.INFO: info_parser,
-    Commands.INSTALL: install_parser
-}
-
 
 def run_conda_command(command, prefix, *arguments):
     """
@@ -103,9 +98,7 @@ def run_conda_command(command, prefix, *arguments):
         prefix: The prefix or the name of environment
         *arguments: Extra arguments
     """
-    p, sub_parsers = generate_parser()
-    assert command in parser_config, "Wrong command for conda {0}".format(command)
-    parser_config[command](sub_parsers)
+    p = generate_parser()
 
     prefix = escape_for_winpath(prefix)
     if arguments:
@@ -120,7 +113,7 @@ def run_conda_command(command, prefix, *arguments):
     args = p.parse_args(split(command_line))
     context._set_argparse_args(args)
     with captured() as c:
-        args.func(args, p)
+        do_call(args, p)
 
     return c.stdout, c.stderr
 
@@ -134,7 +127,8 @@ def remove_env_file(filename='environment.yml'):
     os.remove(filename)
 
 
-class IntegrationTest(unittest.TestCase):
+@pytest.mark.integration
+class IntegrationTests(unittest.TestCase):
 
     def setUp(self):
         rm_rf("environment.yml")
@@ -202,10 +196,9 @@ def env_is_created(env_name):
     Returns: True if created
              False otherwise
     """
-    from conda import misc
-    from os.path import  basename
+    from os.path import basename
 
-    for prefix in misc.list_prefixes():
+    for prefix in list_prefixes():
         name = (ROOT_ENV_NAME if prefix == context.root_dir else
                 basename(prefix))
         if name == env_name:
@@ -214,7 +207,8 @@ def env_is_created(env_name):
     return False
 
 
-class NewIntegrationTest(unittest.TestCase):
+@pytest.mark.integration
+class NewIntegrationTests(unittest.TestCase):
     """
         This is integration test for conda env
         make sure all instruction on online documentation works
@@ -232,14 +226,22 @@ class NewIntegrationTest(unittest.TestCase):
             run_env_command(Commands.ENV_REMOVE, test_env_name_2)
             self.assertFalse(env_is_created(test_env_name_2))
 
-    def test_create_env(self):
+    def test_create_remove_env(self):
         """
-            Test conda create env and conda env remove env
+            Test conda create and remove env
         """
-        run_conda_command(Commands.CREATE, test_env_name_2)
-        self.assertTrue(env_is_created(test_env_name_2))
 
-    def test_export(self):
+        run_conda_command(Commands.CREATE, test_env_name_3)
+        self.assertTrue(env_is_created(test_env_name_3))
+
+        with pytest.raises(EnvironmentLocationNotFound) as execinfo:
+            run_env_command(Commands.ENV_REMOVE, 'does-not-exist')
+
+        run_env_command(Commands.ENV_REMOVE, test_env_name_3)
+        self.assertFalse(env_is_created(test_env_name_3))
+
+
+    def test_env_export(self):
         """
             Test conda env export
         """
@@ -253,10 +255,19 @@ class NewIntegrationTest(unittest.TestCase):
             env_yaml.write(snowflake)
             env_yaml.flush()
             env_yaml.close()
+
             run_env_command(Commands.ENV_REMOVE, test_env_name_2)
             self.assertFalse(env_is_created(test_env_name_2))
             run_env_command(Commands.ENV_CREATE, env_yaml.name)
             self.assertTrue(env_is_created(test_env_name_2))
+
+            # regression test for #6220
+            snowflake, e, = run_env_command(Commands.ENV_EXPORT, test_env_name_2, '--no-builds')
+            assert not e.strip()
+            env_description = yaml_load(snowflake)
+            assert len(env_description['dependencies'])
+            for spec_str in env_description['dependencies']:
+                assert spec_str.count('=') == 1
 
     def test_list(self):
         """
@@ -284,8 +295,9 @@ class NewIntegrationTest(unittest.TestCase):
         """
             Test conda env export
         """
-
-        run_conda_command(Commands.CREATE, test_env_name_2, "python")
+        from conda.core.linked_data import PrefixData
+        PrefixData._cache_.clear()
+        run_conda_command(Commands.CREATE, test_env_name_2, "python=3.5")
         self.assertTrue(env_is_created(test_env_name_2))
 
         # install something from other channel not in config file

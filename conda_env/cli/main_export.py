@@ -1,13 +1,16 @@
 from __future__ import absolute_import, print_function
 
+from argparse import RawDescriptionHelpFormatter
 import os
 import textwrap
-from argparse import RawDescriptionHelpFormatter
-from conda import config
-from ..env import from_environment
+
+from conda.cli.conda_argparse import add_parser_json, add_parser_prefix
+
 # conda env import
-from conda_env.cli.common import get_prefix
+from .common import get_prefix
+from ..env import from_environment
 from ..exceptions import CondaEnvException
+
 description = """
 Export a given environment
 """
@@ -39,13 +42,7 @@ def configure_parser(sub_parsers):
         action="store_true",
         help="Do not include .condarc channels",
     )
-
-    p.add_argument(
-        '-n', '--name',
-        action='store',
-        help='name of environment (in %s)' % os.pathsep.join(config.envs_dirs),
-        default=None,
-    )
+    add_parser_prefix(p)
 
     p.add_argument(
         '-f', '--file',
@@ -67,13 +64,13 @@ def configure_parser(sub_parsers):
         action='store_true',
         required=False,
         help='Do not include channel names with package names.')
-
+    add_parser_json(p)
     p.set_defaults(func=execute)
 
 
 # TODO Make this aware of channels that were used to install packages
 def execute(args, parser):
-    if not args.name:
+    if not (args.name or args.prefix):
         # Note, this is a hack fofr get_prefix that assumes argparse results
         # TODO Refactor common.get_prefix
         name = os.environ.get('CONDA_DEFAULT_ENV', False)

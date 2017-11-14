@@ -3,29 +3,28 @@
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+from collections import defaultdict
 import os
+from os.path import abspath, dirname, exists, expanduser, isdir, isfile, join, relpath
 import re
 import shutil
 import sys
-from collections import defaultdict
-from os.path import (abspath, dirname, exists, expanduser, isdir, isfile, islink, join,
-                     relpath)
 
-from ._vendor.auxlib.path import expand
 from .base.context import context
-from .common.compat import iteritems, iterkeys, itervalues, odict, on_win
-from .common.path import url_to_path
-from .common.url import is_url, join_url, path_to_url
+from .common.compat import iteritems, itervalues, on_win, open
+from .common.path import expand
+from .common.url import is_url, join_url, path_to_url, unquote
 from .core.index import get_index
-from .core.linked_data import is_linked, linked as install_linked, linked_data
-from .exceptions import (CondaRuntimeError, ParseError)
+from .core.link import PrefixSetup, UnlinkLinkTransaction
+from .core.linked_data import PrefixData, linked_data
+from .core.package_cache import PackageCache, ProgressiveFetchExtract
+from .exceptions import PackagesNotFoundError, ParseError
 from .gateways.disk.delete import rm_rf
-from .gateways.disk.read import compute_md5sum
-from .instructions import EXTRACT, FETCH, LINK, RM_EXTRACTED, RM_FETCHED, SYMLINK_CONDA, UNLINK
+from .gateways.disk.link import islink
 from .models.dist import Dist
 from .models.index_record import IndexRecord
-from .plan import execute_actions
-from .resolve import MatchSpec, Resolve
+from .models.match_spec import MatchSpec
+from .resolve import Resolve
 
 
 def conda_installed_files(prefix, exclude_self_build=False):
@@ -34,8 +33,7 @@ def conda_installed_files(prefix, exclude_self_build=False):
     a given prefix.
     """
     res = set()
-    for dist in install_linked(prefix):
-        meta = is_linked(prefix, dist)
+    for dist, meta in iteritems(linked_data(prefix)):
         if exclude_self_build and 'file_hash' in meta:
             continue
         res.update(set(meta.get('files', ())))
@@ -48,91 +46,48 @@ url_pat = re.compile(r'(?:(?P<url_p>.+)(?:[/\\]))?'
 def explicit(specs, prefix, verbose=False, force_extract=True, index_args=None, index=None):
     actions = defaultdict(list)
     actions['PREFIX'] = prefix
-    actions['op_order'] = RM_FETCHED, FETCH, RM_EXTRACTED, EXTRACT, UNLINK, LINK, SYMLINK_CONDA
-    linked = {dist.name: dist for dist in install_linked(prefix)}
-    index_args = index_args or {}
-    index = index or {}
 
-    # get our index
-    index_args = index_args or {}
-    index.update(get_index(
-        channel_urls=context.channels,
-        prepend=False,
-        platform=context.subdir,
-        use_local=index_args.get('use_local', False),
-        use_cache=index_args.get('use_cache', context.offline),
-        unknown=index_args.get('unknown', False),
-        prefix=index_args.get('prefix', False),
-    ))
-
-    def spec_to_parsed_url(spec):
+    fetch_specs = []
+    for spec in specs:
         if spec == '@EXPLICIT':
-            return None, None
+            continue
 
         if not is_url(spec):
-            spec = path_to_url(expand(spec))
+            spec = unquote(path_to_url(expand(spec)))
 
         # parse URL
         m = url_pat.match(spec)
         if m is None:
             raise ParseError('Could not parse explicit URL: %s' % spec)
         url_p, fn, md5sum = m.group('url_p'), m.group('fn'), m.group('md5')
+        url = join_url(url_p, fn)
         # url_p is everything but the tarball_basename and the md5sum
 
-        url = join_url(url_p, fn)
-        return url, md5sum
+        fetch_specs.append(MatchSpec(url, md5=md5sum) if md5sum else MatchSpec(url))
 
-    def url_details_to_dist_record(url, md5sum):
-        dist = Dist(url)
-        if dist in index:
-            record = index[dist]
-            # TODO: we should be able to query across channels for no-channel dist + md5sum matches
-        elif url.startswith('file:/'):
-            md5sum = md5sum or compute_md5sum(url_to_path(url))
-            record = IndexRecord(**{
-                'fn': dist.to_filename(),
-                'url': url,
-                'md5': md5sum,
-                'build': dist.build_string,
-                'build_number': dist.build_number,
-                'name': dist.name,
-                'version': dist.version,
-            })
-        else:
-            # non-local url that's not in index
-            record = IndexRecord(**{
-                'fn': dist.to_filename(),
-                'url': url,
-                'md5': md5sum,
-                'build': dist.build_string,
-                'build_number': dist.build_number,
-                'name': dist.name,
-                'version': dist.version,
-            })
-        return dist, record
+    pfe = ProgressiveFetchExtract(fetch_specs)
+    pfe.execute()
 
-    parsed_urls = (spec_to_parsed_url(spec) for spec in specs)
-    link_index = odict(url_details_to_dist_record(url, md5sum)
-                       for url, md5sum in parsed_urls if url)
-    link_dists = tuple(iterkeys(link_index))
+    # now make an UnlinkLinkTransaction with the PackageCacheRecords as inputs
+    # need to add package name to fetch_specs so that history parsing keeps track of them correctly
+    specs_pcrecs = tuple([spec, next(PackageCache.query_all(spec), None)] for spec in fetch_specs)
+    assert not any(spec_pcrec[1] is None for spec_pcrec in specs_pcrecs)
 
-    # merge new link_index into index
-    for dist, record in iteritems(link_index):
-        _fetched_record = index.get(dist)
-        index[dist] = (IndexRecord.from_objects(record, _fetched_record)
-                       if _fetched_record else record)
+    precs_to_remove = []
+    prefix_data = PrefixData(prefix)
+    for q, (spec, pcrec) in enumerate(specs_pcrecs):
+        new_spec = MatchSpec(spec, name=pcrec.name)
+        specs_pcrecs[q][0] = new_spec
 
-    # unlink any installed packages with same package name
-    unlink_dists = tuple(linked[dist.name] for dist in link_dists if dist.name in linked)
+        prec = prefix_data.get(pcrec.name, None)
+        if prec:
+            precs_to_remove.append(prec)
 
-    for unlink_dist in unlink_dists:
-        actions[UNLINK].append(unlink_dist)
+    stp = PrefixSetup(prefix, precs_to_remove, tuple(sp[1] for sp in specs_pcrecs),
+                      (), tuple(sp[0] for sp in specs_pcrecs))
 
-    for link_dist in link_dists:
-        actions[LINK].append(link_dist)
-
-    execute_actions(actions, index, verbose=verbose)
-    return actions
+    txn = UnlinkLinkTransaction(stp)
+    txn.execute()
 
 
 def rel_path(prefix, path, windows_forward_slashes=True):
@@ -188,27 +143,11 @@ def untracked(prefix, exclude_self_build=False):
                     (path.endswith('.pyc') and path[:-1] in conda_files))}
 
 
-def which_prefix(path):
-    """
-    given the path (to a (presumably) conda installed file) return the
-    environment prefix in which the file in located
-    """
-    prefix = abspath(path)
-    while True:
-        if isdir(join(prefix, 'conda-meta')):
-            # we found the it, so let's return it
-            return prefix
-        if prefix == dirname(prefix):
-            # we cannot chop off any more directories, so we didn't find it
-            return None
-        prefix = dirname(prefix)
-
-
 def touch_nonadmin(prefix):
     """
     Creates $PREFIX/.nonadmin if sys.prefix/.nonadmin exists (on Windows)
     """
-    if on_win and exists(join(context.root_dir, '.nonadmin')):
+    if on_win and exists(join(context.root_prefix, '.nonadmin')):
         if not isdir(prefix):
             os.makedirs(prefix)
         with open(join(prefix, '.nonadmin'), 'w') as fo:
@@ -222,7 +161,7 @@ def append_env(prefix):
             os.mkdir(dir_path)
         with open(join(dir_path, 'environments.txt'), 'a') as f:
             f.write('%s\n' % prefix)
-    except IOError:
+    except (IOError, OSError):
         pass
 
 
@@ -250,16 +189,17 @@ def clone_env(prefix1, prefix2, verbose=True, quiet=False, index_args=None):
                 filter["conda-env"] = dist
                 found = True
                 break
-            for dep in info.get('depends', []):
+            for dep in info.combined_depends:
                 if MatchSpec(dep).name in filter:
                     filter[name] = dist
                     found = True
 
     if filter:
         if not quiet:
-            print('The following packages cannot be cloned out of the root environment:')
+            fh = sys.stderr if context.json else sys.stdout
+            print('The following packages cannot be cloned out of the root environment:', file=fh)
             for pkg in itervalues(filter):
-                print(' - ' + pkg.dist_name)
+                print(' - ' + pkg.dist_name, file=fh)
             drecs = {dist: info for dist, info in iteritems(drecs) if info['name'] not in filter}
 
     # Resolve URLs for packages that do not have URLs
@@ -282,10 +222,7 @@ def clone_env(prefix1, prefix2, verbose=True, quiet=False, index_args=None):
             else:
                 notfound.append(fn)
     if notfound:
-        what = "Package%s " % ('' if len(notfound) == 1 else 's')
-        notfound = '\n'.join(' - ' + fn for fn in notfound)
-        msg = '%s missing in current %s channels:%s' % (what, context.subdir, notfound)
-        raise CondaRuntimeError(msg)
+        raise PackagesNotFoundError(notfound)
 
     # Assemble the URL and channel list
     urls = {}
@@ -337,30 +274,3 @@ def clone_env(prefix1, prefix2, verbose=True, quiet=False, index_args=None):
     actions = explicit(urls, prefix2, verbose=not quiet, index=index,
                        force_extract=False, index_args=index_args)
     return actions, untracked_files
-
-
-def make_icon_url(info):
-    if info.get('channel') and info.get('icon'):
-        base_url = dirname(info['channel'])
-        icon_fn = info['icon']
-        # icon_cache_path = join(pkgs_dir, 'cache', icon_fn)
-        # if isfile(icon_cache_path):
-        #    return url_path(icon_cache_path)
-        return '%s/icons/%s' % (base_url, icon_fn)
-    return ''
-
-
-def list_prefixes():
-    # Lists all the prefixes that conda knows about.
-    for envs_dir in context.envs_dirs:
-        if not isdir(envs_dir):
-            continue
-        for dn in sorted(os.listdir(envs_dir)):
-            if dn.startswith('.'):
-                continue
-            prefix = join(envs_dir, dn)
-            if isdir(prefix):
-                prefix = join(envs_dir, dn)
-                yield prefix
-
-    yield context.root_dir

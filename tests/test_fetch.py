@@ -10,14 +10,14 @@ from conda.base.constants import DEFAULT_CHANNEL_ALIAS
 from conda.base.context import reset_context
 from conda.common.io import env_var
 from conda.exceptions import CondaHTTPError
-from conda.fetch import TmpDownload
-from conda.core.index import fetch_repodata
+from conda.gateways.connection.download import TmpDownload
+from conda.core.repodata import fetch_repodata_remote_request
 from conda.core.package_cache import download
 
 
+@pytest.mark.integration
 class TestConnectionWithShortTimeouts(TestCase):
 
-    @pytest.mark.timeout(6)
     def test_download_connectionerror(self):
         with env_var('CONDA_REMOTE_CONNECT_TIMEOUT_SECS', 1, reset_context):
             with env_var('CONDA_REMOTE_READ_TIMEOUT_SECS', 1, reset_context):
@@ -28,7 +28,6 @@ class TestConnectionWithShortTimeouts(TestCase):
                         download(url, mktemp())
                         assert msg in str(execinfo)
 
-    @pytest.mark.timeout(6)
     def test_fetchrepodate_connectionerror(self):
         with env_var('CONDA_REMOTE_CONNECT_TIMEOUT_SECS', 1, reset_context):
             with env_var('CONDA_REMOTE_READ_TIMEOUT_SECS', 1, reset_context):
@@ -36,7 +35,7 @@ class TestConnectionWithShortTimeouts(TestCase):
                     with pytest.raises(CondaHTTPError) as execinfo:
                         url = "http://240.0.0.0/channel/osx-64"
                         msg = "Connection error:"
-                        fetch_repodata(url)
+                        fetch_repodata_remote_request(url, None, None)
                         assert msg in str(execinfo)
 
     def test_tmpDownload(self):

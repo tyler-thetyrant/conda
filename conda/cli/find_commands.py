@@ -1,27 +1,33 @@
-from __future__ import print_function, division, absolute_import, unicode_literals
+from __future__ import absolute_import, division, print_function, unicode_literals
 
 import os
+from os.path import basename, expanduser, isdir, isfile, join
 import re
 import sys
-from os.path import isdir, isfile, join, expanduser
+import sysconfig
 
+from .._vendor.auxlib.decorators import memoize
 from ..common.compat import on_win
-from ..utils import memoized
+
 
 def find_executable(executable, include_others=True):
     # backwards compatibility
     global dir_paths
 
     if include_others:
+        from ..utils import sys_prefix_unfollowed
+        prefixes = [sys_prefix_unfollowed()]
+        if sys.prefix != prefixes[0]:
+            prefixes.append(sys.prefix)
+        dir_paths = [join(p, basename(sysconfig.get_path('scripts')))
+                     for p in prefixes]
+        # Is this still needed?
         if on_win:
-            dir_paths = [join(sys.prefix, 'Scripts'),
-                         'C:\\cygwin\\bin']
-        else:
-            dir_paths = [join(sys.prefix, 'bin')]
+            dir_paths.append('C:\\cygwin\\bin')
     else:
         dir_paths = []
 
-    dir_paths.extend(os.environ['PATH'].split(os.pathsep))
+    dir_paths.extend(os.environ[str('PATH')].split(os.pathsep))
 
     for dir_path in dir_paths:
         if on_win:
@@ -35,14 +41,20 @@ def find_executable(executable, include_others=True):
                 return expanduser(path)
     return None
 
-@memoized
+
+@memoize
 def find_commands(include_others=True):
+
     if include_others:
+        from ..utils import sys_prefix_unfollowed
+        prefixes = [sys_prefix_unfollowed()]
+        if sys.prefix != prefixes[0]:
+            prefixes.append(sys.prefix)
+        dir_paths = [join(p, basename(sysconfig.get_path('scripts')))
+                     for p in prefixes]
+        # Is this still needed?
         if on_win:
-            dir_paths = [join(sys.prefix, 'Scripts'),
-                         'C:\\cygwin\\bin']
-        else:
-            dir_paths = [join(sys.prefix, 'bin')]
+            dir_paths.append('C:\\cygwin\\bin')
     else:
         dir_paths = []
 
@@ -61,4 +73,4 @@ def find_commands(include_others=True):
             m = pat.match(fn)
             if m:
                 res.add(m.group(1))
-    return sorted(res)
+    return tuple(sorted(res))

@@ -25,10 +25,3 @@ Conda modules strictly prohibited from importing ``conda.gateways`` are
 - ``conda.client``
 
 """
-from __future__ import absolute_import, division, print_function
-
-from .signals import register_signals
-register_signals()
-
-from .logging import initialize_logging  # NOQA
-initialize_logging()

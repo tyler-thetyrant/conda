@@ -1,15 +1,18 @@
 from __future__ import absolute_import, print_function
 
-import os
 from collections import OrderedDict
-from conda.base.context import context
-from conda.cli import common  # TODO: this should never have to import form conda.cli
-from conda.core.linked_data import linked
 from copy import copy
 from itertools import chain
+import os
 
+from conda.base.context import context
+from conda.cli import common  # TODO: this should never have to import form conda.cli
+from conda.common.serialize import yaml_load
+from conda.core.linked_data import linked
+from conda_env.yaml import dump
 from . import compat, exceptions, yaml
 from .pip_util import add_pip_installed
+
 
 def load_from_directory(directory):
     """Load and return an ``Environment`` from a given ``directory``"""
@@ -36,10 +39,9 @@ def from_environment(name, prefix, no_builds=False, ignore_channels=False):
         name: The name of environment
         prefix: The path of prefix
         no_builds: Whether has build requirement
-        ignore_channels: whether ingore_channels
+        ignore_channels: whether ignore_channels
 
-    Returns:     Environment obejct
-
+    Returns:     Environment object
     """
     installed = linked(prefix, ignore_channels=ignore_channels)
     conda_pkgs = copy(installed)
@@ -49,16 +51,16 @@ def from_environment(name, prefix, no_builds=False, ignore_channels=False):
     pip_pkgs = sorted(installed - conda_pkgs)
 
     if no_builds:
-        dependencies = ['='.join(a.quad[0:3]) for a in sorted(conda_pkgs)]
+        dependencies = ['='.join((a.name, a.version)) for a in sorted(conda_pkgs)]
     else:
-        dependencies = ['='.join(a.quad[0:3]) for a in sorted(conda_pkgs)]
+        dependencies = ['='.join((a.name, a.version, a.build)) for a in sorted(conda_pkgs)]
     if len(pip_pkgs) > 0:
         dependencies.append({'pip': ['=='.join(a.rsplit('-', 2)[:2]) for a in pip_pkgs]})
     # conda uses ruamel_yaml which returns a ruamel_yaml.comments.CommentedSeq
     # this doesn't dump correctly using pyyaml
     channels = list(context.channels)
     if not ignore_channels:
-        for dist in installed:
+        for dist in conda_pkgs:
             if dist.channel not in channels:
                 channels.insert(0, dist.channel)
     return Environment(name=name, dependencies=dependencies, channels=channels, prefix=prefix)
@@ -66,7 +68,7 @@ def from_environment(name, prefix, no_builds=False, ignore_channels=False):
 
 def from_yaml(yamlstr, **kwargs):
     """Load and return a ``Environment`` from a given ``yaml string``"""
-    data = yaml.load(yamlstr)
+    data = yaml_load(yamlstr)
     if kwargs is not None:
         for key, value in kwargs.items():
             data[key] = value
@@ -161,7 +163,7 @@ class Environment(object):
 
     def to_yaml(self, stream=None):
         d = self.to_dict()
-        out = compat.u(yaml.dump(d, default_flow_style=False))
+        out = compat.u(dump(d))
         if stream is None:
             return out
         stream.write(compat.b(out, encoding="utf-8"))

@@ -4,55 +4,38 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 from logging import getLogger
 
 from .channel import Channel
-from .enums import FileMode, PathType
-from .index_record import IndexRecord
-from .._vendor.auxlib.entity import (BooleanField, ComposableField, Entity, EnumField,
+from .enums import NoarchType
+from .index_record import IndexJsonRecord, IndexRecord, PathsData
+from .._vendor.auxlib.entity import (ComposableField, Entity, EnumField,
                                      ImmutableEntity, IntegerField, ListField, StringField)
 from ..common.compat import string_types
 
 log = getLogger(__name__)
 
 
+class NoarchField(EnumField):
+    def box(self, instance, instance_type, val):
+        return super(NoarchField, self).box(instance, instance_type, NoarchType.coerce(val))
+
+
 class Noarch(Entity):
-    type = StringField()
-    entry_points = ListField(string_types, required=False)
+    type = NoarchField(NoarchType)
+    entry_points = ListField(string_types, required=False, nullable=True, default=None,
+                             default_in_dump=False)
 
 
 class PreferredEnv(Entity):
     name = StringField()
-    executable_paths = ListField(string_types, required=False)
+    executable_paths = ListField(string_types, required=False, nullable=True)
+    softlink_paths = ListField(string_types, required=False, nullable=True)
 
 
 class PackageMetadata(Entity):
     # from info/package_metadata.json
     package_metadata_version = IntegerField()
-    noarch = ComposableField(Noarch, required=False)
-    preferred_env = ComposableField(PreferredEnv, required=False)
-
-
-class PathData(Entity):
-    _path = StringField()
-    prefix_placeholder = StringField(required=False, nullable=True)
-    file_mode = EnumField(FileMode, required=False, nullable=True)
-    no_link = BooleanField(required=False, nullable=True)
-    path_type = EnumField(PathType)
-
-    @property
-    def path(self):
-        # because I don't have aliases as an option for entity fields yet
-        return self._path
-
-
-class PathDataV1(PathData):
-    sha256 = StringField()
-    size_in_bytes = IntegerField()
-    inode_paths = ListField(string_types, required=False, nullable=True)
-
-
-class PathsData(Entity):
-    # from info/paths.json
-    paths_version = IntegerField()
-    paths = ListField(PathData)
+    noarch = ComposableField(Noarch, required=False, nullable=True)
+    preferred_env = ComposableField(PreferredEnv, required=False, nullable=True, default=None,
+                                    default_in_dump=False)
 
 
 class PackageInfo(ImmutableEntity):
@@ -64,7 +47,26 @@ class PackageInfo(ImmutableEntity):
     url = StringField()
 
     # attributes within the package tarball
-    index_json_record = ComposableField(IndexRecord)
+    index_json_record = ComposableField(IndexJsonRecord)
     icondata = StringField(required=False, nullable=True)
     package_metadata = ComposableField(PackageMetadata, required=False, nullable=True)
     paths_data = ComposableField(PathsData)
+
+    def dist_str(self):
+        return "%s::%s-%s-%s" % (self.channel.canonical_name, self.name, self.version, self.build)
+
+    @property
+    def name(self):
+        return self.repodata_record.name
+
+    @property
+    def version(self):
+        return self.repodata_record.version
+
+    @property
+    def build(self):
+        return self.repodata_record.build
+
+    @property
+    def build_number(self):
+        return self.repodata_record.build_number

@@ -25,27 +25,28 @@ from os import environ, stat
 from os.path import basename, join
 from stat import S_IFDIR, S_IFMT, S_IFREG
 
-from enum import Enum
+from enum import Enum, EnumMeta
 
 from .compat import (isiterable, iteritems, itervalues, odict, primitive_types, string_types,
                      text_type, with_metaclass)
-from .constants import EMPTY_MAP, NULL
-from .yaml import yaml_load
+from .constants import NULL
+from .path import expand
+from .serialize import yaml_load
 from .. import CondaError, CondaMultiError
 from .._vendor.auxlib.collection import AttrDict, first, frozendict, last, make_immutable
 from .._vendor.auxlib.exceptions import ThisShouldNeverHappenError
-from .._vendor.auxlib.path import expand
 from .._vendor.auxlib.type_coercion import TypeCoercionError, typify_data_structure
+from .._vendor.boltons.setutils import IndexedSet
 
-try:
+try:  # pragma: no cover
     from cytoolz.dicttoolz import merge
     from cytoolz.functoolz import excepts
     from cytoolz.itertoolz import concat, concatv, unique
-except ImportError:
+except ImportError:  # pragma: no cover
     from .._vendor.toolz.dicttoolz import merge
     from .._vendor.toolz.functoolz import excepts
     from .._vendor.toolz.itertoolz import concat, concatv, unique
-try:
+try:  # pragma: no cover
     from ruamel_yaml.comments import CommentedSeq, CommentedMap
     from ruamel_yaml.scanner import ScannerError
 except ImportError:  # pragma: no cover
@@ -53,6 +54,8 @@ except ImportError:  # pragma: no cover
     from ruamel.yaml.scanner import ScannerError
 
 log = getLogger(__name__)
+
+EMPTY_MAP = frozendict()
 
 
 def pretty_list(iterable, padding='  '):  # TODO: move elsewhere in conda.common
@@ -104,7 +107,7 @@ class InvalidTypeError(ValidationError):
         self.valid_types = valid_types
         if msg is None:
             msg = ("Parameter %s = %r declared in %s has type %s.\n"
-                   "Valid types: %s." % (parameter_name, parameter_value,
+                   "Valid types:\n%s" % (parameter_name, parameter_value,
                                          source, wrong_type, pretty_list(valid_types)))
         super(InvalidTypeError, self).__init__(parameter_name, parameter_value, source, msg=msg)
 
@@ -144,7 +147,7 @@ def raise_errors(errors):
 
 
 class ParameterFlag(Enum):
-    final = 'final'
+    final = "final"
     top = "top"
     bottom = "bottom"
 
@@ -247,7 +250,7 @@ class ArgParseRawParameter(RawParameter):
         return None
 
     def valueflags(self, parameter_obj):
-        return None
+        return None if isinstance(parameter_obj, PrimitiveParameter) else ()
 
     @classmethod
     def make_raw_parameters(cls, args_from_argparse):
@@ -343,7 +346,8 @@ def load_file_configs(search_path):
         yield fullpath, YamlRawParameter.make_raw_parameters_from_file(fullpath)
 
     def _dir_yaml_loader(fullpath):
-        for filepath in glob(join(fullpath, "*.yml")):
+        for filepath in sorted(concatv(glob(join(fullpath, "*.yml")),
+                                       glob(join(fullpath, "*.yaml")))):
             yield filepath, YamlRawParameter.make_raw_parameters_from_file(filepath)
 
     # map a stat result to a file loader or a directory loader
@@ -504,7 +508,7 @@ class PrimitiveParameter(Parameter):
     python 2 has long and unicode types.
     """
 
-    def __init__(self, default, aliases=(), validation=None, parameter_type=None):
+    def __init__(self, default, aliases=(), validation=None, element_type=None):
         """
         Args:
             default (Any):  The parameter's default value.
@@ -512,11 +516,11 @@ class PrimitiveParameter(Parameter):
             validation (callable): Given a parameter value as input, return a boolean indicating
                 validity, or alternately return a string describing an invalid value. Returning
                 `None` also indicates a valid value.
-            parameter_type (type or Tuple[type]): Type-validation of parameter's value. If None,
+            element_type (type or Tuple[type]): Type-validation of parameter's value. If None,
                 type(default) is used.
 
         """
-        self._type = type(default) if parameter_type is None else parameter_type
+        self._type = type(default) if element_type is None else element_type
         self._element_type = self._type
         super(PrimitiveParameter, self).__init__(default, aliases, validation)
 
@@ -560,7 +564,6 @@ class SequenceParameter(Parameter):
 
     def collect_errors(self, instance, value, source="<<merged>>"):
         errors = super(SequenceParameter, self).collect_errors(instance, value)
-
         element_type = self._element_type
         for idx, element in enumerate(value):
             if not isinstance(element, element_type):
@@ -571,7 +574,12 @@ class SequenceParameter(Parameter):
     def _merge(self, matches):
         # get matches up to and including first important_match
         #   but if no important_match, then all matches are important_matches
-        relevant_matches = self._first_important_matches(matches)
+        relevant_matches_and_values = tuple((match, match.value(self)) for match in
+                                            self._first_important_matches(matches))
+        for match, value in relevant_matches_and_values:
+            if not isinstance(value, tuple):
+                raise InvalidTypeError(self.name, value, match.source, value.__class__.__name__,
+                                       self._type.__name__)
 
         # get individual lines from important_matches that were marked important
         # these will be prepended to the final result
@@ -579,17 +587,18 @@ class SequenceParameter(Parameter):
             return tuple(line
                          for line, flag in zip(match.value(parameter_obj),
                                                match.valueflags(parameter_obj))
-                         if flag is marker)
-        top_lines = concat(get_marked_lines(m, ParameterFlag.top, self) for m in relevant_matches)
+                         if flag is marker) if match else ()
+        top_lines = concat(get_marked_lines(m, ParameterFlag.top, self) for m, _ in
+                           relevant_matches_and_values)
 
         # also get lines that were marked as bottom, but reverse the match order so that lines
         # coming earlier will ultimately be last
-        bottom_lines = concat(get_marked_lines(m, ParameterFlag.bottom, self) for m in
-                              reversed(relevant_matches))
+        bottom_lines = concat(get_marked_lines(m, ParameterFlag.bottom, self) for m, _ in
+                              reversed(relevant_matches_and_values))
 
         # now, concat all lines, while reversing the matches
         #   reverse because elements closer to the end of search path take precedence
-        all_lines = concat(m.value(self) for m in reversed(relevant_matches))
+        all_lines = concat(v for _, v in reversed(relevant_matches_and_values))
 
         # stack top_lines + all_lines, then de-dupe
         top_deduped = tuple(unique(concatv(top_lines, all_lines)))
@@ -611,6 +620,14 @@ class SequenceParameter(Parameter):
             lines.append("  - %s%s" % (self._str_format_value(value),
                                        self._str_format_flag(valueflag)))
         return '\n'.join(lines)
+
+    def _get_all_matches(self, instance):
+        # this is necessary to handle argparse `action="append"`, which can't be set to a
+        #   default value of NULL
+        # it also config settings like `channels: ~`
+        matches, exceptions = super(SequenceParameter, self)._get_all_matches(instance)
+        matches = tuple(m for m in matches if m._raw_value is not None)
+        return matches, exceptions
 
 
 class MapParameter(Parameter):
@@ -639,23 +656,29 @@ class MapParameter(Parameter):
             errors.extend(InvalidElementTypeError(self.name, val, source, type(val),
                                                   element_type, key)
                           for key, val in iteritems(value) if not isinstance(val, element_type))
+
         return errors
 
     def _merge(self, matches):
         # get matches up to and including first important_match
         #   but if no important_match, then all matches are important_matches
-        relevant_matches = self._first_important_matches(matches)
+        relevant_matches_and_values = tuple((match, match.value(self)) for match in
+                                            self._first_important_matches(matches))
+        for match, value in relevant_matches_and_values:
+            if not isinstance(value, Mapping):
+                raise InvalidTypeError(self.name, value, match.source, value.__class__.__name__,
+                                       self._type.__name__)
 
         # mapkeys with important matches
         def key_is_important(match, key):
             return match.valueflags(self).get(key) is ParameterFlag.final
         important_maps = tuple(dict((k, v)
-                                    for k, v in iteritems(match.value(self))
+                                    for k, v in iteritems(match_value)
                                     if key_is_important(match, k))
-                               for match in relevant_matches)
+                               for match, match_value in relevant_matches_and_values)
         # dump all matches in a dict
         # then overwrite with important matches
-        return merge(concatv((m.value(self) for m in relevant_matches),
+        return merge(concatv((v for _, v in relevant_matches_and_values),
                              reversed(important_maps)))
 
     def repr_raw(self, raw_parameter):
@@ -667,6 +690,12 @@ class MapParameter(Parameter):
             lines.append("  %s: %s%s" % (valuekey, self._str_format_value(value),
                                          self._str_format_flag(valueflag)))
         return '\n'.join(lines)
+
+    def _get_all_matches(self, instance):
+        # it also config settings like `proxy_servers: ~`
+        matches, exceptions = super(MapParameter, self)._get_all_matches(instance)
+        matches = tuple(m for m in matches if m._raw_value is not None)
+        return matches, exceptions
 
 
 class ConfigurationType(type):
@@ -689,6 +718,10 @@ class Configuration(object):
         self._reset_callbacks = set()  # TODO: make this a boltons ordered set
         self._validation_errors = defaultdict(list)
 
+        if not hasattr(self, '_search_path') and search_path is not None:
+            # we only set search_path once; we never change it
+            self._search_path = IndexedSet(search_path)
+
         if not hasattr(self, '_app_name') and app_name is not None:
             # we only set app_name once; we never change it
             self._app_name = app_name
@@ -698,22 +731,27 @@ class Configuration(object):
         self._set_argparse_args(argparse_args)
 
     def _set_search_path(self, search_path):
-        self._search_path = search_path
+        if not hasattr(self, '_search_path') and search_path is not None:
+            # we only set search_path once; we never change it
+            self._search_path = IndexedSet(search_path)
 
-        # we need to make sure old data doesn't stick around if we are resetting
-        #   easiest solution is to completely clear raw_data and re-load other sources
-        #   if raw_data holds contents
-        raw_data_held_contents = bool(self.raw_data)
-        if raw_data_held_contents:
-            self.raw_data = odict()
+        if getattr(self, '_search_path', None):
 
-        self._set_raw_data(load_file_configs(search_path))
+            # we need to make sure old data doesn't stick around if we are resetting
+            #   easiest solution is to completely clear raw_data and re-load other sources
+            #   if raw_data holds contents
+            raw_data_held_contents = bool(self.raw_data)
+            if raw_data_held_contents:
+                self.raw_data = odict()
 
-        if raw_data_held_contents:
-            # this should only be triggered on re-initialization / reset
-            self._set_env_vars(getattr(self, '_app_name', None))
-            self._set_argparse_args(self._argparse_args)
+            self._set_raw_data(load_file_configs(search_path))
 
+            if raw_data_held_contents:
+                # this should only be triggered on re-initialization / reset
+                self._set_env_vars(getattr(self, '_app_name', None))
+                self._set_argparse_args(self._argparse_args)
+
+        self._reset_cache()
         return self
 
     def _set_env_vars(self, app_name=None):
@@ -776,8 +814,13 @@ class Configuration(object):
 
             if match is not None:
                 try:
-                    typed_value = typify_data_structure(match.value(parameter),
-                                                        parameter._element_type)
+                    untyped_value = match.value(parameter)
+                    if untyped_value is None:
+                        if isinstance(parameter, SequenceParameter):
+                            untyped_value = ()
+                        elif isinstance(parameter, MapParameter):
+                            untyped_value = {}
+                    typed_value = typify_data_structure(untyped_value, parameter._element_type)
                 except TypeCoercionError as e:
                     validation_errors.append(CustomValidationError(match.key, e.value,
                                                                    match.source, text_type(e)))
@@ -823,3 +866,49 @@ class Configuration(object):
             typed_values[source], validation_errors[source] = self.check_source(source)
         raise_errors(tuple(chain.from_iterable(itervalues(validation_errors))))
         return odict((k, v) for k, v in iteritems(typed_values) if v)
+
+    def describe_parameter(self, parameter_name):
+        # TODO, in Parameter base class, rename element_type to value_type
+        if parameter_name not in self.parameter_names:
+            parameter_name = '_' + parameter_name
+        parameter = self.__class__.__dict__[parameter_name]
+        assert isinstance(parameter, Parameter)
+
+        # dedupe leading underscore from name
+        name = parameter.name.lstrip('_')
+        aliases = tuple(alias for alias in parameter.aliases if alias != name)
+
+        description = self.get_descriptions()[name]
+        et = parameter._element_type
+        if type(et) == EnumMeta:
+            et = [et]
+        if not isiterable(et):
+            et = [et]
+        element_types = tuple(_et.__name__ for _et in et)
+
+        details = {
+            'parameter_type': parameter.__class__.__name__.lower().replace("parameter", ""),
+            'name': name,
+            'aliases': aliases,
+            'element_types': element_types,
+            'default_value': parameter.default,
+            'description': description.replace('\n', ' ').strip(),
+        }
+        if isinstance(parameter, SequenceParameter):
+            details['string_delimiter'] = parameter.string_delimiter
+        return details
+
+    def list_parameters(self):
+        return tuple(sorted(name.lstrip('_') for name in self.parameter_names))
+
+    def typify_parameter(self, parameter_name, value):
+        # return a tuple with correct parameter name and typed-value
+        if parameter_name not in self.parameter_names:
+            parameter_name = '_' + parameter_name
+        parameter = self.__class__.__dict__[parameter_name]
+        assert isinstance(parameter, Parameter)
+
+        return typify_data_structure(value, parameter._element_type)
+
+    def get_descriptions(self):
+        raise NotImplementedError()

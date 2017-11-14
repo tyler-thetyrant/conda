@@ -6,11 +6,11 @@ from logging import getLogger
 import re
 
 from .channel import Channel
+from .index_record import IndexRecord, PackageRef
 from .package_info import PackageInfo
-from .index_record import IndexRecord
 from .. import CondaError
-from .._vendor.auxlib.entity import Entity, EntityType, StringField, IntegerField
-from ..base.constants import CONDA_TARBALL_EXTENSION, DEFAULTS, UNKNOWN_CHANNEL
+from .._vendor.auxlib.entity import Entity, EntityType, IntegerField, StringField
+from ..base.constants import CONDA_TARBALL_EXTENSION, DEFAULTS_CHANNEL_NAME, UNKNOWN_CHANNEL
 from ..base.context import context
 from ..common.compat import ensure_text_type, text_type, with_metaclass
 from ..common.constants import NULL
@@ -28,10 +28,10 @@ class DistType(EntityType):
             value = args[0]
             if isinstance(value, Dist):
                 return value
-            elif value.__class__.__name__ == "Package":
-                return Dist.from_string(value.fn, channel_override=value.schannel)
+            elif hasattr(value, 'dist') and isinstance(value.dist, Dist):
+                return value.dist
             elif isinstance(value, IndexRecord):
-                return Dist.from_string(value.fn, channel_override=value.schannel)
+                return Dist.from_string(value.fn, channel_override=value.channel.canonical_name)
             elif isinstance(value, PackageInfo):
                 return Dist.from_string(value.repodata_record.fn,
                                         channel_override=value.channel.canonical_name)
@@ -45,6 +45,7 @@ class DistType(EntityType):
 
 @with_metaclass(DistType)
 class Dist(Entity):
+    _lazy_validate = True
 
     channel = StringField(required=False, nullable=True, immutable=True)
 
@@ -54,23 +55,29 @@ class Dist(Entity):
     build_string = StringField(immutable=True)
     build_number = IntegerField(immutable=True)
 
-    with_features_depends = StringField(required=False, nullable=True, immutable=True)
     base_url = StringField(required=False, nullable=True, immutable=True)
     platform = StringField(required=False, nullable=True, immutable=True)
 
     def __init__(self, channel, dist_name=None, name=None, version=None, build_string=None,
-                 build_number=None, with_features_depends=None, base_url=None, platform=None):
-        # if name is None:
-        #     import pdb; pdb.set_trace()
+                 build_number=None, base_url=None, platform=None):
         super(Dist, self).__init__(channel=channel,
                                    dist_name=dist_name,
                                    name=name,
                                    version=version,
                                    build_string=build_string,
                                    build_number=build_number,
-                                   with_features_depends=with_features_depends,
                                    base_url=base_url,
                                    platform=platform)
+
+    def to_package_ref(self):
+        return PackageRef(
+            channel=self.channel,
+            subdir=self.platform,
+            name=self.name,
+            version=self.version,
+            build=self.build_string,
+            build_number=self.build_number,
+        )
 
     @property
     def full_name(self):
@@ -81,21 +88,21 @@ class Dist(Entity):
         return self.build_string
 
     @property
+    def subdir(self):
+        return self.platform
+
+    @property
     def pair(self):
-        return self.channel or DEFAULTS, self.dist_name
+        return self.channel or DEFAULTS_CHANNEL_NAME, self.dist_name
 
     @property
     def quad(self):
         # returns: name, version, build_string, channel
         parts = self.dist_name.rsplit('-', 2) + ['', '']
-        return parts[0], parts[1], parts[2], self.channel or DEFAULTS
+        return parts[0], parts[1], parts[2], self.channel or DEFAULTS_CHANNEL_NAME
 
     def __str__(self):
-        base = "%s::%s" % (self.channel, self.dist_name) if self.channel else self.dist_name
-        if self.with_features_depends:
-            return "%s[%s]" % (base, self.with_features_depends)
-        else:
-            return base
+        return "%s::%s" % (self.channel, self.dist_name) if self.channel else self.dist_name
 
     @property
     def is_feature_package(self):
@@ -127,8 +134,7 @@ class Dist(Entity):
                        version="",
                        build_string="",
                        build_number=0,
-                       dist_name=string,
-                       with_features_depends=None)
+                       dist_name=string)
 
         REGEX_STR = (r'(?:([^\s\[\]]+)::)?'        # optional channel
                      r'([^\s\[\]]+)'               # 3.x dist
@@ -142,7 +148,7 @@ class Dist(Entity):
         if channel_override != NULL:
             channel = channel_override
         elif channel is None:
-            channel = DEFAULTS
+            channel = UNKNOWN_CHANNEL
 
         # enforce dist format
         dist_details = cls.parse_dist_name(original_dist)
@@ -151,8 +157,7 @@ class Dist(Entity):
                    version=dist_details.version,
                    build_string=dist_details.build_string,
                    build_number=dist_details.build_number,
-                   dist_name=original_dist,
-                   with_features_depends=w_f_d)
+                   dist_name=original_dist)
 
     @staticmethod
     def parse_dist_name(string):
@@ -199,7 +204,7 @@ class Dist(Entity):
             channel = text_type(Channel(base_url))
         else:
             url_no_tarball = url.rsplit('/', 1)[0]
-            platform = has_platform(url_no_tarball)
+            platform = has_platform(url_no_tarball, context.known_subdirs)
             base_url = url_no_tarball.rsplit('/', 1)[0] if platform else url_no_tarball
             channel = Channel(base_url).canonical_name if platform else UNKNOWN_CHANNEL
 
@@ -221,7 +226,7 @@ class Dist(Entity):
                 else join_url(self.base_url, filename))
 
     def __key__(self):
-        return self.channel, self.dist_name, self.with_features_depends
+        return self.channel, self.dist_name
 
     def __lt__(self, other):
         assert isinstance(other, self.__class__)
@@ -268,3 +273,7 @@ class Dist(Entity):
         if item.endswith(CONDA_TARBALL_EXTENSION):
             item = item[:-len(CONDA_TARBALL_EXTENSION)]
         return item in self.__str__()
+
+    @property
+    def fn(self):
+        return self.to_filename()
